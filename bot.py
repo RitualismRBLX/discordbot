@@ -620,12 +620,13 @@ async def taginfo(ctx, name: str):
 # ─── APPLICATIONS ───
 def _is_valid_answer(text):
     t = text.strip().lower()
-    if len(t) < 5:
+    if len(t) < 2:
         return False
-    if len(set(t)) <= 2:
+    if len(set(t)) <= 1:
         return False
-    lazy = {"no", "n/a", "na", "none", "idk", "dont know", "don't know", "h", "hh", "hhh", "hhhh", "idkk", "nah", "nope", "pass", "skip", "...", "??", "???", "what", "dont know", "dk", "dunno"}
-    if t in lazy:
+    blocklist = {"nigger","nigga","n1gger","n1gga","fag","faggot","chink","kike","spic","retard","jew","coon","dyke","tranny","wetback","gook","raghead","sandnigger","nigg","fagot","faget","niger","niga","negro","neger","k1ke","sp1c","r3tard","retarted","f4g","f4ggot","idk","n/a","na","none","nah","nope","pass","skip","dk","dunno","idkk","???","??","...","what","dont know","don't know"}
+    words = set(t.split())
+    if words & blocklist:
         return False
     return True
 
