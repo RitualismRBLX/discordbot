@@ -28,6 +28,7 @@ def init_db():
     c.execute("CREATE TABLE IF NOT EXISTS warns(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,reason TEXT,mod_id INT,ts TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS strikes(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,reason TEXT,ts TEXT,mod_id INT,log_channel_id INT,log_message_id INT)")
     c.execute("CREATE TABLE IF NOT EXISTS tempbans(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,expiry_timestamp TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS applications(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,content TEXT,status TEXT DEFAULT 'pending',ts TEXT,message_id INT)")
     for col in ("log_channel_id", "log_message_id"):
         try: c.execute(f"ALTER TABLE strikes ADD COLUMN {col} INTEGER")
         except sqlite3.OperationalError: pass
@@ -57,6 +58,8 @@ def require_role(role_name):
             return True
         raise commands.CheckFailure(f"You need the {role_name} role or higher.")
     return commands.check(predicate)
+
+app_sessions = {}  # {user_id: guild_id}
 
 def get_log_channel(guild, name): return discord.utils.get(guild.text_channels, name=name)
 
@@ -605,6 +608,148 @@ async def taginfo(ctx, name: str):
     e.add_field(name="Created", value=row["created"][:10])
     await ctx.send(embed=e)
 
+# ─── APPLICATIONS ───
+@bot.command()
+async def apply(ctx):
+    if not ctx.guild:
+        return await ctx.send("Use this command in the server.")
+    if ctx.author.id in app_sessions:
+        return await ctx.send("You already have an application in progress. Check your DMs.")
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT 1 FROM applications WHERE user_id=? AND guild_id=? AND status='pending'", (ctx.author.id, ctx.guild.id))
+    if c.fetchone():
+        conn.close()
+        return await ctx.send("You already have a pending application. Please wait for a staff member to review it.")
+    conn.close()
+    try:
+        dm = await ctx.author.create_dm()
+    except Exception:
+        return await ctx.send("I couldn't open a DM with you. Please enable DMs from server members.")
+    form = (
+        "─── 𝕬𝕻𝕻𝕷𝕴𝕮𝕬𝕮𝕴𝕺𝕹 𝕱𝕺𝕽𝕸 ───\n\n"
+        "If you seek to earn your place within Cártel Nueva Alianza, complete the application below and submit it to a Recruiter or High Rank. We value skill, loyalty, and the ability to follow orders.\n\n"
+        "[ APPLICATION FOR CÁRTEL NUEVA ALIANZA ]\n\n"
+        "1. Discord Username:\n"
+        "2. Roblox Username:\n"
+        "3. Current In-Game Level:\n"
+        "4. Owned Gamepasses / Spawns (List all that apply):\n"
+        "5. Experience in 'No Mercy' (or similar hood games):\n"
+        "6. Are you currently in any other factions? (If so, list them):\n"
+        "7. What is your primary playstyle? (e.g., Tactical/Combat, Logistics/Grinding, Enforcement):\n"
+        "8. Are you willing to prioritize the Cartel's objectives over solo play?\n"
+        "9. Why Cártel Nueva Alianza?\n\n"
+        "─── APPLICATION POLICY ───\n\n"
+        "• Expectations: Do not ping High Ranks for a response. Your application will be reviewed in the order it was received.\n"
+        "• Requirements: You must have a working microphone for raids and coordination.\n"
+        "• Integrity: Any lies discovered in your application regarding your history, gamepasses, or level will result in an immediate denial.\n\n"
+        "Loyalty is our currency. Prove your worth.\n\n"
+        "Reply with all 9 answers in a single message, numbered 1-9."
+    )
+    await dm.send(form)
+    app_sessions[ctx.author.id] = ctx.guild.id
+    def check(m):
+        return m.author.id == ctx.author.id and isinstance(m.channel, discord.DMChannel)
+    try:
+        msg = await bot.wait_for('message', check=check, timeout=600)
+    except asyncio.TimeoutError:
+        await dm.send("Application timed out after 10 minutes. Run `%apply` again if you still want to apply.")
+        return
+    finally:
+        app_sessions.pop(ctx.author.id, None)
+    lines = [l.strip() for l in msg.content.split('\n') if l.strip()]
+    found = set()
+    for line in lines:
+        first = line.split(None, 1)[0] if line.split(None, 1) else ""
+        num = first.rstrip('.):')
+        if num.isdigit():
+            n = int(num)
+            if 1 <= n <= 9:
+                found.add(n)
+    if len(found) < 9:
+        await dm.send(f"Your application is incomplete. I only detected answers for questions {sorted(found)}. Please run `%apply` again and answer ALL 9 questions.")
+        return
+    formatted = "\n".join(lines)
+    pending_ch = discord.utils.get(ctx.guild.text_channels, name="pending-applications")
+    if not pending_ch:
+        await dm.send("Error: the #pending-applications channel doesn't exist. Contact staff.")
+        return
+    e = discord.Embed(title="New Application", color=discord.Color.green(), timestamp=datetime.datetime.utcnow())
+    e.set_author(name=f"{ctx.author} ({ctx.author.id})", icon_url=ctx.author.display_avatar.url if ctx.author.display_avatar else None)
+    e.description = formatted[:4000]
+    staff_role = discord.utils.get(ctx.guild.roles, name="STAFF")
+    mention = staff_role.mention if staff_role else "@STAFF"
+    try:
+        app_msg = await pending_ch.send(f"{mention} New Application {ctx.author.mention}", embed=e)
+    except Exception:
+        await dm.send("Error submitting your application. Please contact staff.")
+        return
+    conn = db(); c = conn.cursor()
+    c.execute("INSERT INTO applications (user_id,guild_id,content,status,ts,message_id) VALUES (?,?,?,?,?,?)",
+              (ctx.author.id, ctx.guild.id, msg.content, "pending", datetime.datetime.utcnow().isoformat(), app_msg.id))
+    conn.commit(); conn.close()
+    await dm.send("Your application has been submitted successfully! A staff member will review it shortly.")
+
+async def _resolve_member(ctx, arg):
+    try:
+        return await commands.MemberConverter().convert(ctx, arg)
+    except commands.BadArgument:
+        try:
+            uid = int(arg)
+            m = ctx.guild.get_member(uid)
+            if m: return m
+            return await ctx.guild.fetch_member(uid)
+        except (ValueError, discord.NotFound, discord.HTTPException):
+            return None
+
+@bot.command()
+@require_role("STAFF")
+async def accept(ctx, *, target: str):
+    member = await _resolve_member(ctx, target)
+    if not member:
+        return await ctx.send("User not found in this server. Mention them or use their User ID.")
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT id FROM applications WHERE user_id=? AND guild_id=? AND status='pending'", (member.id, ctx.guild.id))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return await ctx.send("No pending application found for this user.")
+    app_id = row["id"]
+    c.execute("UPDATE applications SET status='accepted' WHERE id=?", (app_id,))
+    conn.commit(); conn.close()
+    member_role = discord.utils.get(ctx.guild.roles, name="Member")
+    outsider_role = discord.utils.get(ctx.guild.roles, name="OUTSIDER & UNRANKED")
+    if member_role:
+        try: await member.add_roles(member_role, reason="Application accepted")
+        except discord.Forbidden: pass
+    if outsider_role:
+        try: await member.remove_roles(outsider_role, reason="Application accepted")
+        except discord.Forbidden: pass
+    general = discord.utils.get(ctx.guild.text_channels, name="『💬』general-chat")
+    if general:
+        await general.send(f"Welcome {member.mention} enjoy your stay")
+    await ctx.send(f"Accepted {member.mention}'s application.")
+
+@bot.command()
+@require_role("STAFF")
+async def deny(ctx, *, target: str):
+    member = await _resolve_member(ctx, target)
+    if not member:
+        return await ctx.send("User not found in this server. Mention them or use their User ID.")
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT id FROM applications WHERE user_id=? AND guild_id=? AND status='pending'", (member.id, ctx.guild.id))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return await ctx.send("No pending application found for this user.")
+    app_id = row["id"]
+    c.execute("UPDATE applications SET status='denied' WHERE id=?", (app_id,))
+    conn.commit(); conn.close()
+    try:
+        await member.send("Your application for Cártel Nueva Alianza has been denied. You are welcome to reapply at a later time.")
+    except Exception:
+        pass
+    await ctx.send(f"Denied {member.mention}'s application.")
+
 # ─── HELP ───
 @bot.command()
 async def help(ctx):
@@ -614,6 +759,7 @@ async def help(ctx):
     e.add_field(name="Utility", value="avatar, userinfo, serverinfo, roleinfo, channelinfo, emojiinfo, ping, invite, say, embed, poll, remind, timer", inline=False)
     e.add_field(name="Leveling", value="rank, leaderboard", inline=False)
     e.add_field(name="Tags", value="tag, tagcreate, tagedit, tagdelete, taglist, taginfo", inline=False)
+    e.add_field(name="Applications", value="apply, accept, deny", inline=False)
     await ctx.send(embed=e)
 
 @bot.event
