@@ -105,7 +105,16 @@ async def on_ready():
 
 @bot.event
 async def on_message(msg):
-    if msg.author.bot or not msg.guild: return
+    if msg.author.bot: return
+    if not msg.guild:
+        return
+    if bot.user in msg.mentions and not msg.content.startswith('%'):
+        replies = [
+            f"Hey {msg.author.mention}! I'm a bot. Use `%help` to see what I can do.",
+            f"What's up {msg.author.mention}? Try `%help` for my command list.",
+            f"Yo {msg.author.mention}! Need help? Type `%help`.",
+        ]
+        await msg.channel.send(random.choice(replies))
     conn = db(); c = conn.cursor()
     c.execute("SELECT xp,level FROM levels WHERE user_id=? AND guild_id=?", (msg.author.id, msg.guild.id))
     row = c.fetchone(); add = random.randint(15,25)
@@ -609,6 +618,17 @@ async def taginfo(ctx, name: str):
     await ctx.send(embed=e)
 
 # ─── APPLICATIONS ───
+def _is_valid_answer(text):
+    t = text.strip().lower()
+    if len(t) < 5:
+        return False
+    if len(set(t)) <= 2:
+        return False
+    lazy = {"no", "n/a", "na", "none", "idk", "dont know", "don't know", "h", "hh", "hhh", "hhhh", "idkk", "nah", "nope", "pass", "skip", "...", "??", "???", "what", "dont know", "dk", "dunno"}
+    if t in lazy:
+        return False
+    return True
+
 @bot.command()
 async def apply(ctx):
     if not ctx.guild:
@@ -622,12 +642,24 @@ async def apply(ctx):
         return await ctx.send("You already have a pending application. Please wait for a staff member to review it.")
     conn.close()
     try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+    try:
         dm = await ctx.author.create_dm()
     except Exception:
         return await ctx.send("I couldn't open a DM with you. Please enable DMs from server members.")
     form = (
         "─── 𝕬𝕻𝕻𝕷𝕴𝕮𝕬𝕮𝕴𝕺𝕹 𝕱𝕺𝕽𝕸 ───\n\n"
-        "If you seek to earn your place within Cártel Nueva Alianza, complete the application below and submit it to a Recruiter or High Rank. We value skill, loyalty, and the ability to follow orders.\n\n"
+        "If you seek to earn your place within Cártel Nueva Alianza, complete the application below. We value skill, loyalty, and the ability to follow orders.\n\n"
+        "HOW TO ANSWER:\n"
+        "• Reply in **ONE message** with all 9 answers\n"
+        "• Number each answer like this:\n"
+        "  1. YourDiscordName\n"
+        "  2. YourRobloxName\n"
+        "  3. 500\n"
+        "• Each answer must be at least a few words — single letters like 'h' or 'idk' will be rejected\n"
+        "• Be honest and detailed. Staff will review your answers carefully.\n\n"
         "[ APPLICATION FOR CÁRTEL NUEVA ALIANZA ]\n\n"
         "1. Discord Username:\n"
         "2. Roblox Username:\n"
@@ -642,8 +674,7 @@ async def apply(ctx):
         "• Expectations: Do not ping High Ranks for a response. Your application will be reviewed in the order it was received.\n"
         "• Requirements: You must have a working microphone for raids and coordination.\n"
         "• Integrity: Any lies discovered in your application regarding your history, gamepasses, or level will result in an immediate denial.\n\n"
-        "Loyalty is our currency. Prove your worth.\n\n"
-        "Reply with all 9 answers in a single message, numbered 1-9."
+        "Loyalty is our currency. Prove your worth."
     )
     await dm.send(form)
     app_sessions[ctx.author.id] = ctx.guild.id
@@ -657,18 +688,27 @@ async def apply(ctx):
     finally:
         app_sessions.pop(ctx.author.id, None)
     lines = [l.strip() for l in msg.content.split('\n') if l.strip()]
-    found = set()
+    found = {}
+    bad = []
     for line in lines:
         first = line.split(None, 1)[0] if line.split(None, 1) else ""
         num = first.rstrip('.):')
         if num.isdigit():
             n = int(num)
             if 1 <= n <= 9:
-                found.add(n)
+                rest = line[len(first):].strip()
+                found[n] = rest
     if len(found) < 9:
-        await dm.send(f"Your application is incomplete. I only detected answers for questions {sorted(found)}. Please run `%apply` again and answer ALL 9 questions.")
+        missing = [str(i) for i in range(1,10) if i not in found]
+        await dm.send(f"Your application is incomplete. Missing answers for questions: {', '.join(missing)}. Please run `%apply` again and answer ALL 9 questions with the proper format.")
         return
-    formatted = "\n".join(lines)
+    for n in range(1,10):
+        if not _is_valid_answer(found[n]):
+            bad.append(str(n))
+    if bad:
+        await dm.send(f"Your answers for question(s) {', '.join(bad)} are too short, lazy, or don't make sense. Please run `%apply` again and provide real, detailed answers. Single letters like 'h' or 'idk' are not accepted.")
+        return
+    formatted = "\n".join(f"**{n}.** {found[n]}" for n in range(1,10))
     pending_ch = discord.utils.get(ctx.guild.text_channels, name="pending-applications")
     if not pending_ch:
         await dm.send("Error: the #pending-applications channel doesn't exist. Contact staff.")
