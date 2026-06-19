@@ -653,23 +653,25 @@ async def apply(ctx):
         "─── 𝕬𝕻𝕻𝕷𝕴𝕮𝕬𝕮𝕴𝕺𝕹 𝕱𝕺𝕽𝕸 ───\n\n"
         "If you seek to earn your place within Cártel Nueva Alianza, complete the application below. We value skill, loyalty, and the ability to follow orders.\n\n"
         "HOW TO ANSWER:\n"
-        "• Reply in **ONE message** with all 9 answers\n"
+        "• Reply in **ONE message** with all 10 answers\n"
         "• Number each answer like this:\n"
         "  1. YourDiscordName\n"
         "  2. YourRobloxName\n"
-        "  3. 500\n"
+        "  3. Chicblocko / No Mercy\n"
+        "  4. 500\n"
         "• Each answer must be at least a few words — single letters like 'h' or 'idk' will be rejected\n"
         "• Be honest and detailed. Staff will review your answers carefully.\n\n"
         "[ APPLICATION FOR CÁRTEL NUEVA ALIANZA ]\n\n"
         "1. Discord Username:\n"
         "2. Roblox Username:\n"
-        "3. Current In-Game Level:\n"
-        "4. Owned Gamepasses / Spawns (List all that apply):\n"
-        "5. Experience in 'No Mercy' (or similar hood games):\n"
-        "6. Are you currently in any other factions? (If so, list them):\n"
-        "7. What is your primary playstyle? (e.g., Tactical/Combat, Logistics/Grinding, Enforcement):\n"
-        "8. Are you willing to prioritize the Cartel's objectives over solo play?\n"
-        "9. Why Cártel Nueva Alianza?\n\n"
+        "3. Which game are you applying for? (Chicblocko / No Mercy / Both):\n"
+        "4. Current In-Game Level:\n"
+        "5. Owned Gamepasses / Spawns (List all that apply):\n"
+        "6. Experience in hood games like CB or NM / Similar?\n"
+        "7. Are you currently in any other factions? (If so, list them):\n"
+        "8. What is your primary playstyle? (e.g., Tactical/Combat, Logistics/Grinding, Enforcement):\n"
+        "9. Are you willing to prioritize the Cartel's objectives over solo play?\n"
+        "10. Why Cártel Nueva Alianza?\n\n"
         "─── APPLICATION POLICY ───\n\n"
         "• Expectations: Do not ping High Ranks for a response. Your application will be reviewed in the order it was received.\n"
         "• Requirements: You must have a working microphone for raids and coordination.\n"
@@ -695,20 +697,20 @@ async def apply(ctx):
         num = first.rstrip('.):')
         if num.isdigit():
             n = int(num)
-            if 1 <= n <= 9:
+            if 1 <= n <= 10:
                 rest = line[len(first):].strip()
                 found[n] = rest
-    if len(found) < 9:
-        missing = [str(i) for i in range(1,10) if i not in found]
-        await dm.send(f"Your application is incomplete. Missing answers for questions: {', '.join(missing)}. Please run `%apply` again and answer ALL 9 questions with the proper format.")
+    if len(found) < 10:
+        missing = [str(i) for i in range(1,11) if i not in found]
+        await dm.send(f"Your application is incomplete. Missing answers for questions: {', '.join(missing)}. Please run `%apply` again and answer ALL 10 questions with the proper format.")
         return
-    for n in range(1,10):
+    for n in range(1,11):
         if not _is_valid_answer(found[n]):
             bad.append(str(n))
     if bad:
         await dm.send(f"Your answers for question(s) {', '.join(bad)} are too short, lazy, or don't make sense. Please run `%apply` again and provide real, detailed answers. Single letters like 'h' or 'idk' are not accepted.")
         return
-    formatted = "\n".join(f"**{n}.** {found[n]}" for n in range(1,10))
+    formatted = "\n".join(f"**{n}.** {found[n]}" for n in range(1,11))
     pending_ch = discord.utils.get(ctx.guild.text_channels, name="pending-applications")
     if not pending_ch:
         await dm.send("Error: the #pending-applications channel doesn't exist. Contact staff.")
