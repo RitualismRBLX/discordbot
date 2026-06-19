@@ -29,6 +29,7 @@ def init_db():
     c.execute("CREATE TABLE IF NOT EXISTS strikes(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,reason TEXT,ts TEXT,mod_id INT,log_channel_id INT,log_message_id INT)")
     c.execute("CREATE TABLE IF NOT EXISTS tempbans(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,expiry_timestamp TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS applications(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,content TEXT,status TEXT DEFAULT 'pending',ts TEXT,message_id INT)")
+    c.execute("CREATE TABLE IF NOT EXISTS invites(id INTEGER PRIMARY KEY,inviter_id INT,invitee_id INT,guild_id INT,code TEXT,ts TEXT)")
     for col in ("log_channel_id", "log_message_id"):
         try: c.execute(f"ALTER TABLE strikes ADD COLUMN {col} INTEGER")
         except sqlite3.OperationalError: pass
@@ -60,6 +61,7 @@ def require_role(role_name):
     return commands.check(predicate)
 
 app_sessions = {}  # {user_id: guild_id}
+invites_cache = {}  # {guild_id: {code: uses}}
 
 def get_log_channel(guild, name): return discord.utils.get(guild.text_channels, name=name)
 
@@ -97,11 +99,38 @@ async def check_tempbans():
         except Exception: pass
     conn.close()
 
+async def cache_invites(guild):
+    try:
+        invs = await guild.invites()
+        invites_cache[guild.id] = {i.code: i.uses for i in invs}
+    except Exception:
+        pass
+
 @bot.event
 async def on_ready():
     init_db()
     await check_tempbans()
+    for guild in bot.guilds:
+        await cache_invites(guild)
     print(f"Logged in as {bot.user} ({bot.user.id})")
+
+@bot.event
+async def on_member_join(member):
+    guild = member.guild
+    try:
+        invs = await guild.invites()
+        old = invites_cache.get(guild.id, {})
+        for i in invs:
+            if old.get(i.code, 0) < i.uses:
+                inviter = i.inviter
+                conn = db(); c = conn.cursor()
+                c.execute("INSERT INTO invites (inviter_id,invitee_id,guild_id,code,ts) VALUES (?,?,?,?,?)",
+                          (inviter.id if inviter else None, member.id, guild.id, i.code, datetime.datetime.utcnow().isoformat()))
+                conn.commit(); conn.close()
+                break
+        await cache_invites(guild)
+    except Exception:
+        pass
 
 @bot.event
 async def on_message(msg):
@@ -793,6 +822,41 @@ async def deny(ctx, *, target: str):
         pass
     await ctx.send(f"Denied {member.mention}'s application.")
 
+# ─── INVITES ───
+@bot.command(aliases=["inv"])
+async def invites(ctx, member: discord.Member = None):
+    target = member or ctx.author
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM invites WHERE inviter_id=? AND guild_id=?", (target.id, ctx.guild.id))
+    total = c.fetchone()[0]
+    c.execute("SELECT invitee_id, ts FROM invites WHERE inviter_id=? AND guild_id=? ORDER BY ts DESC LIMIT 10", (target.id, ctx.guild.id))
+    rows = c.fetchall(); conn.close()
+    e = discord.Embed(title=f"Invite Stats: {target}", color=discord.Color.teal())
+    e.add_field(name="Total Invites", value=str(total), inline=False)
+    if rows:
+        recent = []
+        for r in rows:
+            u = ctx.guild.get_member(r["invitee_id"])
+            recent.append(f"{u.mention if u else r['invitee_id']} — {r['ts'][:10]}")
+        e.add_field(name="Recent Joins", value="\n".join(recent), inline=False)
+    await ctx.send(embed=e)
+
+@bot.command(aliases=["invlb","ilb"])
+async def inviteleaderboard(ctx):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT inviter_id, COUNT(*) as cnt FROM invites WHERE guild_id=? GROUP BY inviter_id ORDER BY cnt DESC LIMIT 10", (ctx.guild.id,))
+    rows = c.fetchall(); conn.close()
+    if not rows:
+        return await ctx.send("No invite data yet.")
+    lines = []
+    for i, r in enumerate(rows, 1):
+        u = ctx.guild.get_member(r["inviter_id"])
+        name = u.mention if u else f"<@{r['inviter_id']}>"
+        lines.append(f"**{i}.** {name} — {r['cnt']} invites")
+    e = discord.Embed(title="Invite Leaderboard", color=discord.Color.gold())
+    e.description = "\n".join(lines)
+    await ctx.send(embed=e)
+
 # ─── HELP ───
 @bot.command()
 async def help(ctx):
@@ -802,6 +866,7 @@ async def help(ctx):
     e.add_field(name="Utility", value="avatar, userinfo, serverinfo, roleinfo, channelinfo, emojiinfo, ping, invite, say, embed, poll, remind, timer", inline=False)
     e.add_field(name="Leveling", value="rank, leaderboard", inline=False)
     e.add_field(name="Tags", value="tag, tagcreate, tagedit, tagdelete, taglist, taginfo", inline=False)
+    e.add_field(name="Invites", value="invites, inviteleaderboard", inline=False)
     e.add_field(name="Applications", value="apply, accept, deny", inline=False)
     await ctx.send(embed=e)
 
