@@ -1285,7 +1285,7 @@ async def _end_event(ctx, event_type):
                 asyncio.create_task(_delayed_unban(ctx.guild, user_id, expiry, 7*24*60*60))
             except Exception:
                 pass
-    log_map = {"event": "event-logs", "deployment": "deployment-logs", "raid": "deployment-logs"}
+    log_map = {"event": "event-logs", "deployment": "deployment-event-logs", "raid": "deployment-event-logs"}
     log_ch = get_log_channel(ctx.guild, log_map.get(event_type, "deployment-logs"))
     if log_ch:
         e = discord.Embed(title=f"{event_type.upper()} Ended: {ev['name']}", color=discord.Color.blue())
