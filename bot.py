@@ -126,6 +126,15 @@ def init_db():
             "CREATE TABLE IF NOT EXISTS tickets(id SERIAL PRIMARY KEY,guild_id BIGINT,channel_id BIGINT UNIQUE,user_id BIGINT,claimer_id BIGINT,status TEXT DEFAULT 'open',created_ts TEXT)",
             "CREATE TABLE IF NOT EXISTS activity_checks(id SERIAL PRIMARY KEY,guild_id BIGINT,message_id BIGINT,channel_id BIGINT,ts TEXT)",
             "CREATE TABLE IF NOT EXISTS event_logs(id SERIAL PRIMARY KEY,num BIGINT,event_type TEXT,name TEXT,game_name TEXT,host_id BIGINT,guild_id BIGINT,channel_id BIGINT,message_id BIGINT,start_ts TEXT,end_ts TEXT,attendees TEXT,no_shows TEXT)",
+            "CREATE TABLE IF NOT EXISTS war_logs(id SERIAL PRIMARY KEY,result TEXT,opponent TEXT,score TEXT,mvps TEXT,image_url TEXT,guild_id BIGINT,ts TEXT,mod_id BIGINT)",
+            "CREATE TABLE IF NOT EXISTS staff_notes(id SERIAL PRIMARY KEY,user_id BIGINT,guild_id BIGINT,note TEXT,author_id BIGINT,ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS quotes(id SERIAL PRIMARY KEY,guild_id BIGINT,user_id BIGINT,content TEXT,author_id BIGINT,ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS giveaways(id SERIAL PRIMARY KEY,channel_id BIGINT,message_id BIGINT,prize TEXT,end_ts TEXT,winner_id BIGINT,guild_id BIGINT)",
+            "CREATE TABLE IF NOT EXISTS sticky_messages(id SERIAL PRIMARY KEY,channel_id BIGINT,message_id BIGINT,content TEXT,guild_id BIGINT)",
+            "CREATE TABLE IF NOT EXISTS activity(id SERIAL PRIMARY KEY,user_id BIGINT,guild_id BIGINT,message_count BIGINT DEFAULT 0,week_start TEXT)",
+            "CREATE TABLE IF NOT EXISTS mod_actions(id SERIAL PRIMARY KEY,mod_id BIGINT,action_type TEXT,target_id BIGINT,guild_id BIGINT,ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS pending_approvals(id SERIAL PRIMARY KEY,user_id BIGINT,guild_id BIGINT,ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS app_votes(id SERIAL PRIMARY KEY,app_id BIGINT,voter_id BIGINT,guild_id BIGINT,vote TEXT,ts TEXT)",
         ]
         for sql in pg_tables:
             c.execute(sql)
@@ -147,6 +156,15 @@ def init_db():
             "CREATE TABLE IF NOT EXISTS tickets(id INTEGER PRIMARY KEY,guild_id INT,channel_id INT UNIQUE,user_id INT,claimer_id INT,status TEXT DEFAULT 'open',created_ts TEXT)",
             "CREATE TABLE IF NOT EXISTS activity_checks(id INTEGER PRIMARY KEY,guild_id INT,message_id INT,channel_id INT,ts TEXT)",
             "CREATE TABLE IF NOT EXISTS event_logs(id INTEGER PRIMARY KEY,num INTEGER,event_type TEXT,name TEXT,game_name TEXT,host_id INT,guild_id INT,channel_id INT,message_id INT,start_ts TEXT,end_ts TEXT,attendees TEXT,no_shows TEXT)",
+            "CREATE TABLE IF NOT EXISTS war_logs(id INTEGER PRIMARY KEY,result TEXT,opponent TEXT,score TEXT,mvps TEXT,image_url TEXT,guild_id INT,ts TEXT,mod_id INT)",
+            "CREATE TABLE IF NOT EXISTS staff_notes(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,note TEXT,author_id INT,ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS quotes(id INTEGER PRIMARY KEY,guild_id INT,user_id INT,content TEXT,author_id INT,ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS giveaways(id INTEGER PRIMARY KEY,channel_id INT,message_id INT,prize TEXT,end_ts TEXT,winner_id INT,guild_id INT)",
+            "CREATE TABLE IF NOT EXISTS sticky_messages(id INTEGER PRIMARY KEY,channel_id INT,message_id INT,content TEXT,guild_id INT)",
+            "CREATE TABLE IF NOT EXISTS activity(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,message_count INT DEFAULT 0,week_start TEXT)",
+            "CREATE TABLE IF NOT EXISTS mod_actions(id INTEGER PRIMARY KEY,mod_id INT,action_type TEXT,target_id INT,guild_id INT,ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS pending_approvals(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS app_votes(id INTEGER PRIMARY KEY,app_id INT,voter_id INT,guild_id INT,vote TEXT,ts TEXT)",
         ]
         for t in sqlite_tables:
             c.execute(t)
@@ -195,6 +213,12 @@ def _find_event_by_num(guild_id, num):
 
 ticket_warned = {}  # {channel_id: warned_timestamp}
 lockdown_state = {}  # {guild_id: {channel_id: discord.PermissionOverwrite or None}}
+
+milestone_sent = {}  # {guild_id: {member_count: True}}
+stats_vc_ids = {}  # {guild_id: {"members": channel_id, "bots": channel_id}}
+giveaway_tasks = {}  # {message_id: asyncio.Task}
+vc_lobbies = {}  # {message_id: guild_id}
+pending_app_msgs = {}  # {app_id: message_id} cache for vote tracking
 
 def contains_slur(text):
     t = text.lower()
@@ -325,6 +349,22 @@ async def on_ready():
 @bot.event
 async def on_member_join(member):
     guild = member.guild
+    # Alt account detection
+    acc_age = (datetime.datetime.utcnow() - member.created_at.replace(tzinfo=None)).days
+    if acc_age < 7:
+        conn = db(); c = conn.cursor()
+        c.execute("INSERT INTO pending_approvals (user_id,guild_id,ts) VALUES (?,?,?)", (member.id, guild.id, datetime.datetime.utcnow().isoformat()))
+        conn.commit(); conn.close()
+        mod_ch = get_log_channel(guild, "moderation")
+        if not mod_ch:
+            mod_ch = get_log_channel(guild, "punishment-logs")
+        if mod_ch:
+            e = discord.Embed(title="Pending Manual Approval", description=f"{member.mention} joined with an account only **{acc_age} days** old. Staff must approve.", color=discord.Color.orange())
+            e.add_field(name="Account Created", value=member.created_at.strftime("%Y-%m-%d"), inline=False)
+            e.add_field(name="Action", value="Use `%approve @user` or `%reject @user`", inline=False)
+            await mod_ch.send(embed=e)
+        await member.send("Your account is too new. Staff must manually approve your join. Please wait.")
+        return
     # Auto-role
     auto_role = get_role_by_name(guild, "OUTSIDER & UNRANKED")
     if auto_role:
@@ -338,13 +378,22 @@ async def on_member_join(member):
             await member.edit(nick="Moderated Nickname")
         except Exception:
             pass
-    # Welcome message
+    # Welcome message + milestones
     welcome_ch = discord.utils.get(guild.text_channels, name="『👋🏽』welcome-and-fairwell")
     if welcome_ch:
         e = discord.Embed(title="Welcome!", description=f"{member.mention} has joined the server.", color=discord.Color.green())
         e.set_thumbnail(url=member.display_avatar.url)
         e.set_footer(text=f"Member count: {guild.member_count}")
         await welcome_ch.send(embed=e)
+    # Member milestones
+    milestones = [100, 500, 1000, 2500, 5000]
+    for m in milestones:
+        if guild.member_count >= m and not milestone_sent.get(guild.id, {}).get(m):
+            if guild.id not in milestone_sent:
+                milestone_sent[guild.id] = {}
+            milestone_sent[guild.id][m] = True
+            if welcome_ch:
+                await welcome_ch.send(f"🎉 **Server milestone reached!** {m} members! 🎉")
     try:
         invs = await guild.invites()
         old = invites_cache.get(guild.id, {})
@@ -433,13 +482,6 @@ async def daily_activity_check():
                 pass
 
 @bot.event
-async def on_raw_reaction_add(payload):
-    if str(payload.emoji) != "✅":
-        return
-    if payload.message_id in active_events:
-        active_events[payload.message_id]["reactors"].add(payload.user_id)
-
-@bot.event
 async def on_message_delete(message):
     if message.author.bot or not message.guild:
         return
@@ -465,14 +507,57 @@ async def on_message_edit(before, after):
         e.add_field(name="Jump", value=f"[Jump to message]({after.jump_url})", inline=False)
         await log_ch.send(embed=e)
 
+CHEAT_TERMS = ["matcha", "cookie", "cookies", "potassium", "matrix", "esp"]
+BLACKLIST_WORDS = set(SLUR_PATTERNS + CHEAT_TERMS)
+
+def contains_blacklist(text):
+    t = text.lower()
+    return any(word in t for word in BLACKLIST_WORDS)
+
 @bot.event
 async def on_message(msg):
     if msg.author.bot: return
     if not msg.guild:
         return
+    # Activity tracking
+    if msg.content and len(msg.content) > 3:
+        week_start = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+        conn = db(); c = conn.cursor()
+        c.execute("SELECT id, message_count FROM activity WHERE user_id=? AND guild_id=? AND week_start=?", (msg.author.id, msg.guild.id, week_start))
+        row = c.fetchone()
+        if row:
+            c.execute("UPDATE activity SET message_count = message_count + 1 WHERE id=?", (row["id"],))
+        else:
+            c.execute("INSERT INTO activity (user_id, guild_id, message_count, week_start) VALUES (?,?,?,?)", (msg.author.id, msg.guild.id, 1, week_start))
+        conn.commit(); conn.close()
+    # Message blacklist
+    if contains_blacklist(msg.content):
+        try:
+            await msg.delete()
+            await msg.channel.send(f"{msg.author.mention} That language is not allowed here.", delete_after=5)
+        except Exception:
+            pass
+        return
     # Clear ticket inactivity warning if message sent in ticket channel
     if msg.channel.name.startswith("ticket-") and msg.channel.id in ticket_warned:
         ticket_warned.pop(msg.channel.id, None)
+    # Sticky messages
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT message_id, content FROM sticky_messages WHERE channel_id=?", (msg.channel.id,))
+    sticky = c.fetchone(); conn.close()
+    if sticky:
+        try:
+            old = await msg.channel.fetch_message(sticky["message_id"])
+            await old.delete()
+        except Exception:
+            pass
+        try:
+            new_msg = await msg.channel.send(sticky["content"])
+            conn = db(); c = conn.cursor()
+            c.execute("UPDATE sticky_messages SET message_id=? WHERE channel_id=?", (new_msg.id, msg.channel.id))
+            conn.commit(); conn.close()
+        except Exception:
+            pass
     if bot.user in msg.mentions and not msg.content.startswith('%'):
         replies = [
             f"Hey {msg.author.mention}! I'm a bot. Use `%help` to see what I can do.",
@@ -524,11 +609,16 @@ def parse_event_time(time_str):
 # ─── MODERATION ───
 async def _log_punishment(guild, action, member, mod, reason=""):
     log_ch = get_log_channel(guild, "punishment-logs")
+    ts = datetime.datetime.utcnow().isoformat()
+    conn = db(); c = conn.cursor()
+    c.execute("INSERT INTO mod_actions (mod_id,action_type,target_id,guild_id,ts) VALUES (?,?,?,?,?)",
+              (mod.id, action, member.id if isinstance(member, discord.Member) else member, guild.id, ts))
+    conn.commit(); conn.close()
     if not log_ch:
         return
-    ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    ts_str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     r = f" | reason; {reason}" if reason else ""
-    await log_ch.send(f"[{ts}] action; {action} | user; {member.mention} | mod; {mod.mention}{r}")
+    await log_ch.send(f"[{ts_str}] action; {action} | user; {member.mention if isinstance(member, discord.Member) else member} | mod; {mod.mention}{r}")
 
 @bot.command(aliases=["mban"])
 @commands.has_permissions(ban_members=True)
@@ -1013,108 +1103,6 @@ def _is_valid_answer(text):
         return False
     return True
 
-@bot.command()
-async def apply(ctx):
-    if not ctx.guild:
-        return await ctx.send("Use this command in the server.")
-    if ctx.author.id in app_sessions:
-        return await ctx.send("You already have an application in progress. Check your DMs.")
-    conn = db(); c = conn.cursor()
-    c.execute("SELECT 1 FROM applications WHERE user_id=? AND guild_id=? AND status='pending'", (ctx.author.id, ctx.guild.id))
-    if c.fetchone():
-        conn.close()
-        return await ctx.send("You already have a pending application. Please wait for a staff member to review it.")
-    conn.close()
-    try:
-        await ctx.message.delete()
-    except Exception:
-        pass
-    try:
-        dm = await ctx.author.create_dm()
-    except Exception:
-        return await ctx.send("I couldn't open a DM with you. Please enable DMs from server members.")
-    form = (
-        "─── 𝕬𝕻𝕻𝕷𝕴𝕮𝕬𝕮𝕴𝕺𝕹 𝕱𝕺𝕽𝕸 ───\n\n"
-        "If you seek to earn your place within Cártel Nueva Alianza, complete the application below. We value skill, loyalty, and the ability to follow orders.\n\n"
-        "HOW TO ANSWER:\n"
-        "• Reply in **ONE message** with all 10 answers\n"
-        "• Number each answer like this:\n"
-        "  1. YourDiscordName\n"
-        "  2. YourRobloxName\n"
-        "  3. Chicblocko / No Mercy\n"
-        "  4. 500\n"
-        "• Each answer must be at least a few words — single letters like 'h' or 'idk' will be rejected\n"
-        "• Be honest and detailed. Staff will review your answers carefully.\n\n"
-        "[ APPLICATION FOR CÁRTEL NUEVA ALIANZA ]\n\n"
-        "1. Discord Username:\n"
-        "2. Roblox Username:\n"
-        "3. Which game are you applying for? (Chicblocko / No Mercy / Both):\n"
-        "4. Current In-Game Level:\n"
-        "5. Owned Gamepasses / Spawns (List all that apply):\n"
-        "6. Experience in hood games like CB or NM / Similar?\n"
-        "7. Are you currently in any other factions? (If so, list them):\n"
-        "8. What is your primary playstyle? (e.g., Tactical/Combat, Logistics/Grinding, Enforcement):\n"
-        "9. Are you willing to prioritize the Cartel's objectives over solo play?\n"
-        "10. Why Cártel Nueva Alianza?\n\n"
-        "─── APPLICATION POLICY ───\n\n"
-        "• Expectations: Do not ping High Ranks for a response. Your application will be reviewed in the order it was received.\n"
-        "• Requirements: You must have a working microphone for raids and coordination.\n"
-        "• Integrity: Any lies discovered in your application regarding your history, gamepasses, or level will result in an immediate denial.\n\n"
-        "Loyalty is our currency. Prove your worth."
-    )
-    await dm.send(form)
-    app_sessions[ctx.author.id] = ctx.guild.id
-    def check(m):
-        return m.author.id == ctx.author.id and isinstance(m.channel, discord.DMChannel)
-    try:
-        msg = await bot.wait_for('message', check=check, timeout=600)
-    except asyncio.TimeoutError:
-        await dm.send("Application timed out after 10 minutes. Run `%apply` again if you still want to apply.")
-        return
-    finally:
-        app_sessions.pop(ctx.author.id, None)
-    lines = [l.strip() for l in msg.content.split('\n') if l.strip()]
-    found = {}
-    bad = []
-    for line in lines:
-        first = line.split(None, 1)[0] if line.split(None, 1) else ""
-        num = first.rstrip('.):')
-        if num.isdigit():
-            n = int(num)
-            if 1 <= n <= 10:
-                rest = line[len(first):].strip()
-                found[n] = rest
-    if len(found) < 10:
-        missing = [str(i) for i in range(1,11) if i not in found]
-        await dm.send(f"Your application is incomplete. Missing answers for questions: {', '.join(missing)}. Please run `%apply` again and answer ALL 10 questions with the proper format.")
-        return
-    for n in range(1,11):
-        if not _is_valid_answer(found[n]):
-            bad.append(str(n))
-    if bad:
-        await dm.send(f"Your answers for question(s) {', '.join(bad)} are too short, lazy, or don't make sense. Please run `%apply` again and provide real, detailed answers. Single letters like 'h' or 'idk' are not accepted.")
-        return
-    formatted = "\n".join(f"**{n}.** {found[n]}" for n in range(1,11))
-    pending_ch = discord.utils.get(ctx.guild.text_channels, name="pending-applications")
-    if not pending_ch:
-        await dm.send("Error: the #pending-applications channel doesn't exist. Contact staff.")
-        return
-    e = discord.Embed(title="New Application", color=discord.Color.green(), timestamp=datetime.datetime.utcnow())
-    e.set_author(name=f"{ctx.author} ({ctx.author.id})", icon_url=ctx.author.display_avatar.url if ctx.author.display_avatar else None)
-    e.description = formatted[:4000]
-    staff_role = discord.utils.get(ctx.guild.roles, name="STAFF")
-    mention = staff_role.mention if staff_role else "@STAFF"
-    try:
-        app_msg = await pending_ch.send(f"{mention} New Application {ctx.author.mention}", embed=e)
-    except Exception:
-        await dm.send("Error submitting your application. Please contact staff.")
-        return
-    conn = db(); c = conn.cursor()
-    c.execute("INSERT INTO applications (user_id,guild_id,content,status,ts,message_id) VALUES (?,?,?,?,?,?)",
-              (ctx.author.id, ctx.guild.id, msg.content, "pending", datetime.datetime.utcnow().isoformat(), app_msg.id))
-    conn.commit(); conn.close()
-    await dm.send("Your application has been submitted successfully! A staff member will review it shortly.")
-
 async def _resolve_member(ctx, arg):
     try:
         return await commands.MemberConverter().convert(ctx, arg)
@@ -1126,55 +1114,6 @@ async def _resolve_member(ctx, arg):
             return await ctx.guild.fetch_member(uid)
         except (ValueError, discord.NotFound, discord.HTTPException):
             return None
-
-@bot.command()
-@require_role("STAFF")
-async def accept(ctx, *, target: str):
-    member = await _resolve_member(ctx, target)
-    if not member:
-        return await ctx.send("User not found in this server. Mention them or use their User ID.")
-    conn = db(); c = conn.cursor()
-    c.execute("SELECT id FROM applications WHERE user_id=? AND guild_id=? AND status='pending'", (member.id, ctx.guild.id))
-    row = c.fetchone()
-    if not row:
-        conn.close()
-        return await ctx.send("No pending application found for this user.")
-    app_id = row["id"]
-    c.execute("UPDATE applications SET status='accepted' WHERE id=?", (app_id,))
-    conn.commit(); conn.close()
-    member_role = discord.utils.get(ctx.guild.roles, name="Member")
-    outsider_role = discord.utils.get(ctx.guild.roles, name="OUTSIDER & UNRANKED")
-    if member_role:
-        try: await member.add_roles(member_role, reason="Application accepted")
-        except discord.Forbidden: pass
-    if outsider_role:
-        try: await member.remove_roles(outsider_role, reason="Application accepted")
-        except discord.Forbidden: pass
-    general = discord.utils.get(ctx.guild.text_channels, name="『💬』general-chat")
-    if general:
-        await general.send(f"Welcome {member.mention} enjoy your stay")
-    await ctx.send(f"Accepted {member.mention}'s application.")
-
-@bot.command()
-@require_role("STAFF")
-async def deny(ctx, *, target: str):
-    member = await _resolve_member(ctx, target)
-    if not member:
-        return await ctx.send("User not found in this server. Mention them or use their User ID.")
-    conn = db(); c = conn.cursor()
-    c.execute("SELECT id FROM applications WHERE user_id=? AND guild_id=? AND status='pending'", (member.id, ctx.guild.id))
-    row = c.fetchone()
-    if not row:
-        conn.close()
-        return await ctx.send("No pending application found for this user.")
-    app_id = row["id"]
-    c.execute("UPDATE applications SET status='denied' WHERE id=?", (app_id,))
-    conn.commit(); conn.close()
-    try:
-        await member.send("Your application for Cártel Nueva Alianza has been denied. You are welcome to reapply at a later time.")
-    except Exception:
-        pass
-    await ctx.send(f"Denied {member.mention}'s application.")
 
 # ─── INVITES ───
 @bot.command(aliases=["inv"])
@@ -1627,18 +1566,19 @@ async def raidcancel(ctx, number: str, *, reason: str):
 @bot.command()
 async def help(ctx):
     e = discord.Embed(title="Command List", color=discord.Color.blurple())
-    e.add_field(name="Moderation", value="**Capo**: unban\n**Senior Lieutenant+**: ban, tempban\n**Lieutenant+**: addrole, removerole\n**Head Admin+**: kick, nick\n**Admin+**: purge, slowmode, lock, unlock, lockdown, unlockdown\n**Moderator+**: mute, unmute\n**STAFF+**: warn, warnlist, unwarn, clearwarnings, strike, removestrike (warns auto-decay after 14 days)", inline=False)
+    e.add_field(name="Moderation", value="**Capo**: unban\n**Senior Lieutenant+**: ban, tempban\n**Lieutenant+**: addrole, removerole, promote, demote\n**Head Admin+**: kick, nick\n**Admin+**: purge, slowmode, lock, unlock, lockdown, unlockdown\n**Moderator+**: mute, unmute, tempmute\n**STAFF+**: warn, warnlist, unwarn, clearwarnings, strike, removestrike, approve, reject, modstats, note, notes (warns auto-decay after 14 days)", inline=False)
     e.add_field(name="Fun", value="8ball, coinflip, roll, rps, choose, rate, reverse, mock, cat, dog, meme", inline=False)
-    e.add_field(name="Utility", value="avatar, userinfo, serverinfo, roleinfo, channelinfo, emojiinfo, ping, invite, say, embed, poll, remind, timer, inviteleaderboard", inline=False)
-    e.add_field(name="Auto Features", value="Auto-role: OUTSIDER & UNRANKED | Welcome/Leave: 『👋🏽』welcome-and-fairwell | Message Logging: #message-logs | Warn Decay: 14 days", inline=False)
+    e.add_field(name="Utility", value="avatar, userinfo, serverinfo, roleinfo, channelinfo, emojiinfo, ping, invite, say, embed, poll, remind, timer, inviteleaderboard, activity, attendance, topattendees, warstats, quote, quotes", inline=False)
+    e.add_field(name="Auto Features", value="Auto-role: OUTSIDER & UNRANKED | Welcome/Leave: 『👋🏽』welcome-and-fairwell | Message Logging: #message-logs | Warn Decay: 14 days | Alt Detection: <7 days", inline=False)
     e.add_field(name="Tags", value="tag, tagcreate, tagedit, tagdelete, taglist, taginfo", inline=False)
     e.add_field(name="Invites", value="invites, inviteleaderboard", inline=False)
-    e.add_field(name="Applications", value="apply, accept, deny", inline=False)
+    e.add_field(name="Applications", value="apply, staffapply, pendingapps, review (STAFF+)", inline=False)
     e.add_field(name="Tickets", value="ticket, claim, rename, add, remove, close (STAFF+)", inline=False)
-    e.add_field(name="War Ranks", value="warrank (Lieutenant+)", inline=False)
+    e.add_field(name="War Ranks", value="warrank (Lieutenant+), warwin, warloss (STAFF+)", inline=False)
     e.add_field(name="Events", value="`%event <name> <time>` → `%eventstart #N` → `%eventend #N` / `%eventcancel #N <reason>` (STAFF+)", inline=False)
     e.add_field(name="Deployments", value="`%deployment <game> <time>` → `%deploymentstart #N` → `%deploymentend #N` / `%deploymentcancel #N <reason>` (STAFF+)", inline=False)
     e.add_field(name="Raids", value="`%raid <game> <time>` → `%raidstart #N` → `%raidend #N` / `%raidcancel #N <reason>` (STAFF+)", inline=False)
+    e.add_field(name="Engagement", value="suggest, giveaway (STAFF+), sticky (STAFF+), archive (STAFF+), vclobby (STAFF+)", inline=False)
     e.add_field(name="Roblox", value="verifyroblox", inline=False)
     await ctx.send(embed=e)
 
@@ -1659,6 +1599,679 @@ async def dbstatus(ctx):
     except Exception as err:
         e.add_field(name="Connection", value=f"FAILED: `{err}`", inline=False)
     await ctx.send(embed=e)
+
+@bot.command()
+@require_role("STAFF")
+async def approve(ctx, member: discord.Member):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT id FROM pending_approvals WHERE user_id=? AND guild_id=?", (member.id, ctx.guild.id))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return await ctx.send(f"{member.mention} is not in the pending approval list.")
+    c.execute("DELETE FROM pending_approvals WHERE id=?", (row["id"],))
+    conn.commit(); conn.close()
+    auto_role = get_role_by_name(ctx.guild, "OUTSIDER & UNRANKED")
+    if auto_role:
+        try: await member.add_roles(auto_role)
+        except Exception: pass
+    welcome_ch = discord.utils.get(ctx.guild.text_channels, name="『👋🏽』welcome-and-fairwell")
+    if welcome_ch:
+        await welcome_ch.send(f"Welcome {member.mention}! Approved by {ctx.author.mention}.")
+    await ctx.send(f"Approved {member.mention}.")
+
+@bot.command()
+@require_role("STAFF")
+async def reject(ctx, member: discord.Member):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT id FROM pending_approvals WHERE user_id=? AND guild_id=?", (member.id, ctx.guild.id))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return await ctx.send(f"{member.mention} is not in the pending approval list.")
+    c.execute("DELETE FROM pending_approvals WHERE id=?", (row["id"],))
+    conn.commit(); conn.close()
+    try:
+        await member.send("Your join request was rejected by server staff.")
+    except Exception:
+        pass
+    try:
+        await member.kick(reason="Rejected by staff (alt account)")
+    except Exception:
+        await ctx.send(f"Rejected {member.mention}. Could not kick — remove manually if needed.")
+        return
+    await ctx.send(f"Rejected and kicked {member.mention}.")
+
+@bot.command()
+@require_role("STAFF")
+async def modstats(ctx, member: discord.Member = None):
+    target = member or ctx.author
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT action_type, COUNT(*) as cnt FROM mod_actions WHERE mod_id=? AND guild_id=? GROUP BY action_type", (target.id, ctx.guild.id))
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        return await ctx.send(f"No mod actions found for {target.mention}.")
+    e = discord.Embed(title=f"Mod Stats — {target.name}", color=discord.Color.blurple())
+    total = 0
+    for r in rows:
+        e.add_field(name=r["action_type"].capitalize(), value=str(r["cnt"]), inline=True)
+        total += r["cnt"]
+    e.set_footer(text=f"Total actions: {total}")
+    await ctx.send(embed=e)
+
+# ─── WAR TRACKER ───
+@bot.command()
+@require_role("STAFF")
+async def warwin(ctx, opponent: str, score: str, mvp1: discord.Member, mvp2: discord.Member = None, mvp3: discord.Member = None, *, image_url: str = ""):
+    mvps = [m for m in (mvp1, mvp2, mvp3) if m]
+    mvp_names = ", ".join(m.display_name for m in mvps)
+    conn = db(); c = conn.cursor()
+    c.execute("INSERT INTO war_logs (result,opponent,score,mvps,image_url,guild_id,ts,mod_id) VALUES (?,?,?,?,?,?,?,?)",
+              ("win", opponent, score, mvp_names, image_url or None, ctx.guild.id, datetime.datetime.utcnow().isoformat(), ctx.author.id))
+    conn.commit(); conn.close()
+    log_ch = get_log_channel(ctx.guild, "『🏆』war-logs")
+    if log_ch:
+        e = discord.Embed(title="War Victory", color=discord.Color.gold())
+        e.add_field(name="Opponent", value=opponent, inline=True)
+        e.add_field(name="Score", value=score, inline=True)
+        e.add_field(name="MVPs", value=mvp_names, inline=False)
+        e.set_footer(text=f"Logged by {ctx.author.name}")
+        if image_url:
+            e.set_image(url=image_url)
+        await log_ch.send(embed=e)
+    await ctx.send(f"War win logged vs **{opponent}** — Score: `{score}` — MVPs: {mvp_names}")
+
+@bot.command()
+@require_role("STAFF")
+async def warloss(ctx, opponent: str, score: str):
+    conn = db(); c = conn.cursor()
+    c.execute("INSERT INTO war_logs (result,opponent,score,mvps,image_url,guild_id,ts,mod_id) VALUES (?,?,?,?,?,?,?,?)",
+              ("loss", opponent, score, None, None, ctx.guild.id, datetime.datetime.utcnow().isoformat(), ctx.author.id))
+    conn.commit(); conn.close()
+    log_ch = get_log_channel(ctx.guild, "『🏆』war-logs")
+    if log_ch:
+        e = discord.Embed(title="War Defeat", color=discord.Color.red())
+        e.add_field(name="Opponent", value=opponent, inline=True)
+        e.add_field(name="Score", value=score, inline=True)
+        e.set_footer(text=f"Logged by {ctx.author.name}")
+        await log_ch.send(embed=e)
+    await ctx.send(f"War loss logged vs **{opponent}** — Score: `{score}`")
+
+@bot.command()
+async def warstats(ctx):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT result, COUNT(*) FROM war_logs WHERE guild_id=? GROUP BY result", (ctx.guild.id,))
+    rows = c.fetchall(); conn.close()
+    wins = 0; losses = 0
+    for r in rows:
+        if r["result"] == "win": wins = r[1]
+        elif r["result"] == "loss": losses = r[1]
+    total = wins + losses
+    ratio = f"{wins}/{total}" if total else "N/A"
+    e = discord.Embed(title="War Stats", color=discord.Color.blurple())
+    e.add_field(name="Wins", value=str(wins), inline=True)
+    e.add_field(name="Losses", value=str(losses), inline=True)
+    e.add_field(name="Record", value=ratio, inline=True)
+    await ctx.send(embed=e)
+
+# ─── STAFF NOTES ───
+@bot.command()
+@require_role("STAFF")
+async def note(ctx, member: discord.Member, *, text: str):
+    conn = db(); c = conn.cursor()
+    c.execute("INSERT INTO staff_notes (user_id,guild_id,note,author_id,ts) VALUES (?,?,?,?,?)",
+              (member.id, ctx.guild.id, text, ctx.author.id, datetime.datetime.utcnow().isoformat()))
+    conn.commit(); conn.close()
+    await ctx.send(f"Note added for {member.mention}.")
+
+@bot.command()
+@require_role("STAFF")
+async def notes(ctx, member: discord.Member):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT note, author_id, ts FROM staff_notes WHERE user_id=? AND guild_id=? ORDER BY id DESC", (member.id, ctx.guild.id))
+    rows = c.fetchall(); conn.close()
+    if not rows:
+        return await ctx.send(f"No notes found for {member.mention}.")
+    e = discord.Embed(title=f"Staff Notes — {member.name}", color=discord.Color.blurple())
+    for i, r in enumerate(rows[:10]):
+        author = ctx.guild.get_member(r["author_id"])
+        a_name = author.mention if author else f"<@{r['author_id']}>"
+        e.add_field(name=f"#{i+1} — {r['ts'][:10]}", value=f"By: {a_name}\n{r['note'][:500]}", inline=False)
+    await ctx.send(embed=e)
+
+# ─── PROMOTION / DEMOTION ───
+@bot.command()
+@require_role("Lieutenant")
+async def promote(ctx, member: discord.Member, *, role_name: str):
+    role = get_role_by_name(ctx.guild, role_name)
+    if not role:
+        return await ctx.send(f"Role `{role_name}` not found.")
+    try:
+        await member.add_roles(role)
+        log_ch = get_log_channel(ctx.guild, "promotion-logs")
+        if log_ch:
+            ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+            await log_ch.send(f"[{ts}] PROMOTION | {member.mention} → **{role.name}** by {ctx.author.mention}")
+        await ctx.send(f"Promoted {member.mention} to **{role.name}**.")
+    except discord.Forbidden:
+        await ctx.send("Missing permissions.")
+
+@bot.command()
+@require_role("Lieutenant")
+async def demote(ctx, member: discord.Member, *, role_name: str):
+    role = get_role_by_name(ctx.guild, role_name)
+    if not role:
+        return await ctx.send(f"Role `{role_name}` not found.")
+    if role not in member.roles:
+        return await ctx.send(f"{member.mention} does not have that role.")
+    try:
+        await member.remove_roles(role)
+        log_ch = get_log_channel(ctx.guild, "promotion-logs")
+        if log_ch:
+            ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+            await log_ch.send(f"[{ts}] DEMOTION | {member.mention} ← **{role.name}** by {ctx.author.mention}")
+        await ctx.send(f"Demoted {member.mention} from **{role.name}**.")
+    except discord.Forbidden:
+        await ctx.send("Missing permissions.")
+
+# ─── ACTIVITY TRACKER ───
+@bot.command()
+async def activity(ctx, member: discord.Member = None):
+    target = member or ctx.author
+    week_start = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT message_count FROM activity WHERE user_id=? AND guild_id=? AND week_start=?", (target.id, ctx.guild.id, week_start))
+    row = c.fetchone(); conn.close()
+    count = row["message_count"] if row else 0
+    await ctx.send(f"{target.mention} has sent **{count}** messages this week.")
+
+# ─── ATTENDANCE STREAKS ───
+@bot.command()
+async def attendance(ctx, member: discord.Member = None):
+    target = member or ctx.author
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT attendees FROM event_logs WHERE guild_id=?", (ctx.guild.id,))
+    rows = c.fetchall(); conn.close()
+    attended = 0
+    streak = 0
+    max_streak = 0
+    for r in rows:
+        atts = r["attendees"] or ""
+        uids = set(int(x) for x in atts.split(",") if x.strip().isdigit())
+        if target.id in uids:
+            attended += 1
+            streak += 1
+            max_streak = max(max_streak, streak)
+        else:
+            streak = 0
+    await ctx.send(f"{target.mention} attended **{attended}** event(s). Best streak: **{max_streak}**.")
+
+@bot.command()
+async def topattendees(ctx):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT attendees FROM event_logs WHERE guild_id=?", (ctx.guild.id,))
+    rows = c.fetchall(); conn.close()
+    counts = {}
+    for r in rows:
+        atts = r["attendees"] or ""
+        for uid in atts.split(","):
+            uid = uid.strip()
+            if uid.isdigit():
+                counts[int(uid)] = counts.get(int(uid), 0) + 1
+    top = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:10]
+    if not top:
+        return await ctx.send("No attendance data yet.")
+    lines = []
+    for i, (uid, cnt) in enumerate(top, 1):
+        u = ctx.guild.get_member(uid)
+        name = u.mention if u else f"<@{uid}>"
+        lines.append(f"**{i}.** {name} — {cnt} events")
+    e = discord.Embed(title="Top Attendees", color=discord.Color.gold())
+    e.description = "\n".join(lines)
+    await ctx.send(embed=e)
+
+# ─── SUGGESTIONS ───
+@bot.command()
+async def suggest(ctx, *, idea: str):
+    ch = get_log_channel(ctx.guild, "『🤔』suggestions")
+    if not ch:
+        return await ctx.send("Suggestions channel not found.")
+    e = discord.Embed(title="Suggestion", description=idea[:4000], color=discord.Color.blurple())
+    e.set_author(name=ctx.author.name, icon_url=ctx.author.display_avatar.url)
+    msg = await ch.send(embed=e)
+    await msg.add_reaction("✅")
+    await msg.add_reaction("❌")
+    await ctx.send(f"Suggestion posted in {ch.mention}.")
+
+# ─── QUOTES ───
+@bot.command()
+async def quote(ctx, member: discord.Member, *, text: str):
+    conn = db(); c = conn.cursor()
+    c.execute("INSERT INTO quotes (guild_id,user_id,content,author_id,ts) VALUES (?,?,?,?,?)",
+              (ctx.guild.id, member.id, text, ctx.author.id, datetime.datetime.utcnow().isoformat()))
+    conn.commit(); conn.close()
+    await ctx.send(f"Quote saved from {member.mention}!")
+
+@bot.command()
+async def quotes(ctx, member: discord.Member = None):
+    conn = db(); c = conn.cursor()
+    if member:
+        c.execute("SELECT content, author_id, ts FROM quotes WHERE guild_id=? AND user_id=? ORDER BY id DESC", (ctx.guild.id, member.id))
+    else:
+        c.execute("SELECT content, user_id, author_id, ts FROM quotes WHERE guild_id=? ORDER BY id DESC LIMIT 20", (ctx.guild.id,))
+    rows = c.fetchall(); conn.close()
+    if not rows:
+        return await ctx.send("No quotes found.")
+    e = discord.Embed(title="Quotes", color=discord.Color.blurple())
+    for i, r in enumerate(rows[:10]):
+        q = r["content"][:200]
+        uid = r.get("user_id", member.id if member else None)
+        u = ctx.guild.get_member(uid) if uid else None
+        name = u.mention if u else f"<@{uid}>"
+        e.add_field(name=f"#{i+1} — {name}", value=q, inline=False)
+    await ctx.send(embed=e)
+
+# ─── STICKY MESSAGES ───
+@bot.command()
+@require_role("STAFF")
+async def sticky(ctx, *, text: str):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT message_id FROM sticky_messages WHERE channel_id=?", (ctx.channel.id,))
+    old = c.fetchone()
+    if old:
+        try:
+            msg = await ctx.channel.fetch_message(old["message_id"])
+            await msg.delete()
+        except Exception:
+            pass
+    msg = await ctx.channel.send(text)
+    if old:
+        c.execute("UPDATE sticky_messages SET message_id=?, content=? WHERE channel_id=?", (msg.id, text, ctx.channel.id))
+    else:
+        c.execute("INSERT INTO sticky_messages (channel_id,message_id,content,guild_id) VALUES (?,?,?,?)", (ctx.channel.id, msg.id, text, ctx.guild.id))
+    conn.commit(); conn.close()
+    await ctx.send("Sticky message set.", delete_after=3)
+
+# ─── TIMED MUTE ───
+@bot.command(aliases=["mtempmute"])
+@commands.has_permissions(moderate_members=True)
+@require_role("Moderator")
+async def tempmute(ctx, member: discord.Member, duration: str, *, reason="No reason"):
+    d = parse_dur(duration)
+    if d is None: return await ctx.send("Invalid duration. Use `1h`, `30m`, `1d`, etc.")
+    if d > datetime.timedelta(days=28): return await ctx.send("Max 28 days.")
+    try:
+        until = datetime.datetime.utcnow() + d
+        await member.timeout(until, reason=f"Tempmute ({duration}): {reason}")
+        await _log_punishment(ctx.guild, "tempmute", member, ctx.author, reason)
+        await ctx.send(f"Tempmuted {member.mention} for `{duration}`. `{reason}`")
+    except discord.Forbidden:
+        await ctx.send("Missing permissions.")
+
+# ─── CHANNEL ARCHIVE ───
+@bot.command()
+@require_role("STAFF")
+async def archive(ctx):
+    cat = discord.utils.get(ctx.guild.categories, name="Archives")
+    if not cat:
+        try:
+            cat = await ctx.guild.create_category("Archives")
+        except Exception:
+            return await ctx.send("Could not create 'Archives' category.")
+    try:
+        await ctx.channel.edit(category=cat)
+        await ctx.send(f"Archived {ctx.channel.mention}.")
+    except Exception:
+        await ctx.send("Could not archive channel.")
+
+# ─── CUSTOM VC CREATOR ───
+@bot.command()
+@require_role("STAFF")
+async def vclobby(ctx):
+    e = discord.Embed(title="Create a Voice Channel", description="React with 🎤 to create your own temporary voice channel!", color=discord.Color.blurple())
+    msg = await ctx.send(embed=e)
+    await msg.add_reaction("🎤")
+    vc_lobbies[msg.id] = ctx.guild.id
+
+# ─── BULK ROLE MANAGEMENT ───
+@bot.command()
+@require_role("Lieutenant")
+async def addrole(ctx, role: discord.Role, *members: discord.Member):
+    if not members:
+        return await ctx.send("Mention at least one user.")
+    added = 0
+    for m in members:
+        try:
+            await m.add_roles(role)
+            added += 1
+        except Exception:
+            pass
+    await ctx.send(f"Added **{role.name}** to {added}/{len(members)} user(s).")
+
+@bot.command()
+@require_role("Lieutenant")
+async def removerole(ctx, role: discord.Role, *members: discord.Member):
+    if not members:
+        return await ctx.send("Mention at least one user.")
+    removed = 0
+    for m in members:
+        try:
+            await m.remove_roles(role)
+            removed += 1
+        except Exception:
+            pass
+    await ctx.send(f"Removed **{role.name}** from {removed}/{len(members)} user(s).")
+
+# ─── GIVEAWAYS ───
+@bot.command()
+@require_role("STAFF")
+async def giveaway(ctx, duration: str, *, prize: str):
+    d = parse_dur(duration)
+    if d is None:
+        return await ctx.send("Invalid duration. Use `1h`, `30m`, `1d`, etc.")
+    end = datetime.datetime.utcnow() + d
+    e = discord.Embed(title="🎉 Giveaway", description=f"**Prize:** {prize}\n**Ends:** <t:{int(end.timestamp())}:R>\nReact with 🎉 to enter!", color=discord.Color.gold())
+    msg = await ctx.send(embed=e)
+    await msg.add_reaction("🎉")
+    conn = db(); c = conn.cursor()
+    c.execute("INSERT INTO giveaways (channel_id,message_id,prize,end_ts,guild_id) VALUES (?,?,?,?,?)",
+              (ctx.channel.id, msg.id, prize, end.isoformat(), ctx.guild.id))
+    conn.commit(); conn.close()
+    task = bot.loop.create_task(_end_giveaway(msg.id, end))
+    giveaway_tasks[msg.id] = task
+
+async def _end_giveaway(msg_id, end_time):
+    delay = (end_time - datetime.datetime.utcnow()).total_seconds()
+    if delay > 0:
+        await asyncio.sleep(delay)
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT channel_id, prize FROM giveaways WHERE message_id=?", (msg_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close(); return
+    ch = bot.get_channel(row["channel_id"])
+    if not ch:
+        c.execute("DELETE FROM giveaways WHERE message_id=?", (msg_id,))
+        conn.commit(); conn.close(); return
+    try:
+        msg = await ch.fetch_message(msg_id)
+        users = []
+        for reaction in msg.reactions:
+            if str(reaction.emoji) == "🎉":
+                async for u in reaction.users():
+                    if not u.bot:
+                        users.append(u)
+        if users:
+            winner = random.choice(users)
+            c.execute("UPDATE giveaways SET winner_id=? WHERE message_id=?", (winner.id, msg_id))
+            conn.commit(); conn.close()
+            await ch.send(f"🎉 Giveaway ended! **{winner.mention}** won **{row['prize']}**!")
+        else:
+            c.execute("DELETE FROM giveaways WHERE message_id=?", (msg_id,))
+            conn.commit(); conn.close()
+            await ch.send("Giveaway ended — no participants.")
+    except Exception:
+        c.execute("DELETE FROM giveaways WHERE message_id=?", (msg_id,))
+        conn.commit(); conn.close()
+
+# ─── APPLICATIONS RESTRUCTURE ───
+async def _run_application(ctx, app_type, questions):
+    if ctx.author.id in app_sessions:
+        return await ctx.send("You already have an application in progress. Check your DMs.")
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT 1 FROM applications WHERE user_id=? AND guild_id=? AND status='pending'", (ctx.author.id, ctx.guild.id))
+    if c.fetchone():
+        conn.close()
+        return await ctx.send("You already have a pending application. Please wait for staff to review.")
+    conn.close()
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+    try:
+        dm = await ctx.author.create_dm()
+    except Exception:
+        return await ctx.send("I couldn't open a DM with you. Please enable DMs from server members.")
+    header = f"─── {'STAFF' if app_type == 'staff' else 'MEMBER'} APPLICATION ───\n\nReply in **ONE message** with all {len(questions)} answers numbered.\n\n"
+    q_text = "\n".join(f"{i+1}. {q}" for i, q in enumerate(questions))
+    await dm.send(header + q_text + "\n\nBe detailed. Short or lazy answers will be rejected.")
+    app_sessions[ctx.author.id] = ctx.guild.id
+    def check(m):
+        return m.author.id == ctx.author.id and isinstance(m.channel, discord.DMChannel)
+    try:
+        msg = await bot.wait_for('message', check=check, timeout=600)
+    except asyncio.TimeoutError:
+        app_sessions.pop(ctx.author.id, None)
+        return await dm.send("Application timed out after 10 minutes.")
+    app_sessions.pop(ctx.author.id, None)
+    lines = [l.strip() for l in msg.content.split('\n') if l.strip()]
+    found = {}
+    bad = []
+    for line in lines:
+        parts = line.split(None, 1)
+        if not parts:
+            continue
+        num = parts[0].rstrip('.):')
+        if num.isdigit():
+            n = int(num)
+            if 1 <= n <= len(questions):
+                rest = parts[1] if len(parts) > 1 else ""
+                found[n] = rest
+    if len(found) < len(questions):
+        missing = [str(i) for i in range(1, len(questions)+1) if i not in found]
+        await dm.send(f"Incomplete. Missing answers: {', '.join(missing)}. Run the command again.")
+        return
+    for n in range(1, len(questions)+1):
+        if not _is_valid_answer(found[n]):
+            bad.append(str(n))
+    if bad:
+        await dm.send(f"Answers for question(s) {', '.join(bad)} are too short or lazy. Run the command again with real answers.")
+        return
+    formatted = "\n".join(f"**{n}.** {found[n]}" for n in range(1, len(questions)+1))
+    pending_ch = discord.utils.get(ctx.guild.text_channels, name="pending-applications")
+    if not pending_ch:
+        await dm.send("Error: the #pending-applications channel doesn't exist. Contact staff.")
+        return
+    e = discord.Embed(title=f"New {'Staff' if app_type == 'staff' else 'Member'} Application", color=discord.Color.green(), timestamp=datetime.datetime.utcnow())
+    e.set_author(name=f"{ctx.author} ({ctx.author.id})", icon_url=ctx.author.display_avatar.url if ctx.author.display_avatar else None)
+    e.description = formatted[:4000]
+    e.set_footer(text=f"Type: {app_type} | Use %review #N to vote")
+    staff_role = discord.utils.get(ctx.guild.roles, name="STAFF")
+    mention = staff_role.mention if staff_role else "@STAFF"
+    try:
+        app_msg = await pending_ch.send(f"{mention} New Application {ctx.author.mention}", embed=e)
+        await app_msg.add_reaction("✅")
+    except Exception:
+        await dm.send("Error submitting your application. Contact staff.")
+        return
+    conn = db(); c = conn.cursor()
+    c.execute("INSERT INTO applications (user_id,guild_id,content,status,ts,message_id) VALUES (?,?,?,?,?,?)",
+              (ctx.author.id, ctx.guild.id, msg.content, "pending", datetime.datetime.utcnow().isoformat(), app_msg.id))
+    app_id = c.lastrowid if not IS_PG else None
+    if IS_PG:
+        c.execute("SELECT id FROM applications WHERE user_id=? AND guild_id=? AND message_id=?", (ctx.author.id, ctx.guild.id, app_msg.id))
+        app_id = c.fetchone()["id"]
+    conn.commit(); conn.close()
+    pending_app_msgs[app_id] = app_msg.id
+    await dm.send("Your application has been submitted successfully! A staff member will review it shortly.")
+
+MEMBER_QUESTIONS = [
+    "Discord Username:",
+    "Roblox Username:",
+    "Which game are you applying for? (Chicblocko / No Mercy / Both):",
+    "Current In-Game Level:",
+    "Owned Gamepasses / Spawns (List all that apply):",
+    "Experience in hood games like CB or NM / Similar?",
+    "Are you currently in any other factions? (If so, list them):",
+    "What is your primary playstyle? (e.g., Tactical/Combat, Logistics/Grinding, Enforcement):",
+    "Are you willing to prioritize the Cartel's objectives over solo play?",
+    "Why Cártel Nueva Alianza?"
+]
+
+STAFF_QUESTIONS = [
+    "Discord Username:",
+    "Roblox Username:",
+    "What position are you applying for? (Moderator / Admin / etc.):",
+    "How long have you been in the server?",
+    "What experience do you have with moderation or leadership?",
+    "Why do you want to join the staff team?",
+    "How would you handle a rule-breaking member?",
+    "What timezone are you in?"
+]
+
+@bot.command()
+async def apply(ctx):
+    if not ctx.guild:
+        return await ctx.send("Use this command in the server.")
+    await _run_application(ctx, "member", MEMBER_QUESTIONS)
+
+@bot.command()
+async def staffapply(ctx):
+    if not ctx.guild:
+        return await ctx.send("Use this command in the server.")
+    await _run_application(ctx, "staff", STAFF_QUESTIONS)
+
+@bot.command()
+@require_role("STAFF")
+async def pendingapps(ctx):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT id, user_id, ts, message_id FROM applications WHERE guild_id=? AND status='pending'", (ctx.guild.id,))
+    rows = c.fetchall(); conn.close()
+    if not rows:
+        return await ctx.send("No pending applications.")
+    lines = []
+    for r in rows:
+        u = ctx.guild.get_member(r["user_id"])
+        name = u.mention if u else f"<@{r['user_id']}>"
+        lines.append(f"**#{r['id']}** — {name} — {r['ts'][:10]}")
+    e = discord.Embed(title="Pending Applications", description="\n".join(lines), color=discord.Color.orange())
+    e.set_footer(text="Use %review #<id> to view details and vote.")
+    await ctx.send(embed=e)
+
+@bot.command()
+@require_role("STAFF")
+async def review(ctx, app_id: int):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT user_id, content, status, message_id FROM applications WHERE id=? AND guild_id=?", (app_id, ctx.guild.id))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return await ctx.send("Application not found.")
+    if row["status"] != "pending":
+        conn.close()
+        return await ctx.send(f"This application is already **{row['status']}**.")
+    c.execute("SELECT voter_id, vote FROM app_votes WHERE app_id=?", (app_id,))
+    votes = c.fetchall(); conn.close()
+    yes = sum(1 for v in votes if v["vote"] == "yes")
+    no = sum(1 for v in votes if v["vote"] == "no")
+    e = discord.Embed(title=f"Application #{app_id}", color=discord.Color.blurple())
+    u = ctx.guild.get_member(row["user_id"])
+    e.set_author(name=u.name if u else f"User {row['user_id']}", icon_url=u.display_avatar.url if u else None)
+    e.description = row["content"][:4000] if row["content"] else "(no content)"
+    e.add_field(name="Votes", value=f"✅ {yes} | ❌ {no}", inline=False)
+    e.set_footer(text="React with ✅ to approve or ❌ to deny this application.")
+    msg = await ctx.send(embed=e)
+    await msg.add_reaction("✅")
+    await msg.add_reaction("❌")
+
+@bot.event
+async def on_raw_reaction_add(payload):
+    # Custom VC lobby
+    if str(payload.emoji) == "🎤" and payload.message_id in vc_lobbies:
+        guild = bot.get_guild(payload.guild_id)
+        if not guild:
+            return
+        member = guild.get_member(payload.user_id)
+        if not member or member.bot:
+            return
+        cat = discord.utils.get(guild.categories, name="Custom VCs")
+        if not cat:
+            try:
+                cat = await guild.create_category("Custom VCs")
+            except Exception:
+                return
+        try:
+            vc = await guild.create_voice_channel(f"{member.display_name}'s VC", category=cat)
+            await member.move_to(vc)
+        except Exception:
+            pass
+        return
+    # Application votes
+    if str(payload.emoji) == "✅" and payload.guild_id:
+        guild = bot.get_guild(payload.guild_id)
+        if not guild:
+            return
+        member = guild.get_member(payload.user_id)
+        if not member or member.bot or not is_staff(member):
+            return
+        conn = db(); c = conn.cursor()
+        c.execute("SELECT id, user_id, status FROM applications WHERE message_id=? AND guild_id=?", (payload.message_id, payload.guild_id))
+        row = c.fetchone()
+        if row and row["status"] == "pending":
+            app_id = row["id"]
+            c.execute("SELECT 1 FROM app_votes WHERE app_id=? AND voter_id=?", (app_id, payload.user_id))
+            if not c.fetchone():
+                c.execute("INSERT INTO app_votes (app_id,voter_id,guild_id,vote,ts) VALUES (?,?,?,?,?)",
+                          (app_id, payload.user_id, payload.guild_id, "yes", datetime.datetime.utcnow().isoformat()))
+                conn.commit()
+                c.execute("SELECT COUNT(*) FROM app_votes WHERE app_id=? AND vote='yes'", (app_id,))
+                yes_count = c.fetchone()[0]
+                if yes_count >= 3:
+                    c.execute("UPDATE applications SET status='accepted' WHERE id=?", (app_id,))
+                    conn.commit()
+                    target = guild.get_member(row["user_id"])
+                    if target:
+                        member_role = discord.utils.get(guild.roles, name="Member")
+                        outsider_role = discord.utils.get(guild.roles, name="OUTSIDER & UNRANKED")
+                        if member_role:
+                            try: await target.add_roles(member_role)
+                            except Exception: pass
+                        if outsider_role:
+                            try: await target.remove_roles(outsider_role)
+                            except Exception: pass
+                        general = discord.utils.get(guild.text_channels, name="『💬』general-chat")
+                        if general:
+                            await general.send(f"Welcome {target.mention} enjoy your stay")
+        conn.close()
+        return
+    if str(payload.emoji) == "❌" and payload.guild_id:
+        guild = bot.get_guild(payload.guild_id)
+        if not guild:
+            return
+        member = guild.get_member(payload.user_id)
+        if not member or member.bot or not is_staff(member):
+            return
+        conn = db(); c = conn.cursor()
+        c.execute("SELECT id, user_id, status FROM applications WHERE message_id=? AND guild_id=?", (payload.message_id, payload.guild_id))
+        row = c.fetchone()
+        if row and row["status"] == "pending":
+            app_id = row["id"]
+            c.execute("SELECT 1 FROM app_votes WHERE app_id=? AND voter_id=?", (app_id, payload.user_id))
+            if not c.fetchone():
+                c.execute("INSERT INTO app_votes (app_id,voter_id,guild_id,vote,ts) VALUES (?,?,?,?,?)",
+                          (app_id, payload.user_id, payload.guild_id, "no", datetime.datetime.utcnow().isoformat()))
+                conn.commit()
+                c.execute("SELECT COUNT(*) FROM app_votes WHERE app_id=? AND vote='no'", (app_id,))
+                no_count = c.fetchone()[0]
+                if no_count >= 3:
+                    c.execute("UPDATE applications SET status='denied' WHERE id=?", (app_id,))
+                    conn.commit()
+        conn.close()
+        return
+    if str(payload.emoji) != "✅":
+        return
+    if payload.message_id in active_events:
+        active_events[payload.message_id]["reactors"].add(payload.user_id)
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if before.channel and before.channel.category and before.channel.category.name == "Custom VCs":
+        if len(before.channel.members) == 0:
+            try:
+                await before.channel.delete(reason="Empty custom VC")
+            except Exception:
+                pass
 
 @bot.event
 async def on_command_error(ctx, error):
