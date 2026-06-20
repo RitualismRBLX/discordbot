@@ -8,6 +8,9 @@ TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN or TOKEN == "your_bot_token_here":
     print("ERROR: BOT_TOKEN missing"); exit(1)
 
+DB_URL = os.getenv("DATABASE_URL")
+IS_PG = bool(DB_URL)
+
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
@@ -15,28 +18,111 @@ intents.guilds = True
 bot = commands.Bot(command_prefix="%", intents=intents, help_command=None, case_insensitive=True)
 DB = "bot_data.db"
 
+class UnifiedRow:
+    def __init__(self, real_row, cols):
+        self._row = real_row
+        self._cols = cols
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return list(self._row.values())[key] if hasattr(self._row, 'values') else self._row[key]
+        return self._row[key]
+    def __iter__(self):
+        return iter(self._row)
+    def keys(self):
+        return self._row.keys() if hasattr(self._row, 'keys') else []
+    def values(self):
+        return self._row.values() if hasattr(self._row, 'values') else []
+    def get(self, key, default=None):
+        return self._row.get(key, default) if hasattr(self._row, 'get') else (self._row[key] if key in self._row else default)
+
+class UnifiedCursor:
+    def __init__(self, real_cursor, is_pg):
+        self._c = real_cursor
+        self._is_pg = is_pg
+        self._lastrowid = None
+    def execute(self, operation, parameters=()):
+        if self._is_pg:
+            operation = operation.replace("?", "%s")
+            op_upper = operation.strip().upper()
+            if op_upper.startswith("INSERT") and "RETURNING" not in op_upper:
+                operation = operation.rstrip(";") + " RETURNING id"
+                self._c.execute(operation, parameters)
+                row = self._c.fetchone()
+                self._lastrowid = row["id"] if row else None
+            else:
+                self._c.execute(operation, parameters)
+                self._lastrowid = None
+        else:
+            self._c.execute(operation, parameters)
+            self._lastrowid = self._c.lastrowid
+    def fetchone(self):
+        row = self._c.fetchone()
+        if row is None:
+            return None
+        if self._is_pg:
+            return UnifiedRow(row, row.keys() if hasattr(row, 'keys') else [])
+        return row
+    def fetchall(self):
+        if self._is_pg:
+            return [UnifiedRow(r, r.keys() if hasattr(r, 'keys') else []) for r in self._c.fetchall()]
+        return self._c.fetchall()
+    @property
+    def lastrowid(self):
+        return self._lastrowid
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+
+class UnifiedConn:
+    def __init__(self, real_conn, is_pg):
+        self._conn = real_conn
+        self._is_pg = is_pg
+    def cursor(self):
+        return UnifiedCursor(self._conn.cursor(), self._is_pg)
+    def commit(self):
+        self._conn.commit()
+    def close(self):
+        self._conn.close()
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
 def db():
+    if IS_PG:
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+        return UnifiedConn(psycopg2.connect(DB_URL, cursor_factory=RealDictCursor), True)
     conn = sqlite3.connect(DB)
     conn.row_factory = sqlite3.Row
-    return conn
+    return UnifiedConn(conn, False)
+
+def pg_schema(sql_str):
+    if not IS_PG:
+        return sql_str
+    return (sql_str
+        .replace("INTEGER PRIMARY KEY", "SERIAL PRIMARY KEY")
+        .replace("INT PRIMARY KEY", "SERIAL PRIMARY KEY"))
 
 def init_db():
     conn = db()
     c = conn.cursor()
-    c.execute("CREATE TABLE IF NOT EXISTS levels(user_id INT,guild_id INT,xp INT,level INT,PRIMARY KEY(user_id,guild_id))")
-    c.execute("CREATE TABLE IF NOT EXISTS tags(name TEXT,guild_id INT,content TEXT,author_id INT,uses INT DEFAULT 0,created TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS warns(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,reason TEXT,mod_id INT,ts TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS strikes(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,reason TEXT,ts TEXT,mod_id INT,log_channel_id INT,log_message_id INT)")
-    c.execute("CREATE TABLE IF NOT EXISTS tempbans(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,expiry_timestamp TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS applications(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,content TEXT,status TEXT DEFAULT 'pending',ts TEXT,message_id INT)")
-    c.execute("CREATE TABLE IF NOT EXISTS invites(id INTEGER PRIMARY KEY,inviter_id INT,invitee_id INT,guild_id INT,code TEXT,ts TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS roblox_verify(user_id INT PRIMARY KEY,roblox_id INT,roblox_username TEXT,verified_ts TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS tickets(id INTEGER PRIMARY KEY,guild_id INT,channel_id INT UNIQUE,user_id INT,claimer_id INT,status TEXT DEFAULT 'open',created_ts TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS activity_checks(id INTEGER PRIMARY KEY,guild_id INT,message_id INT,channel_id INT,ts TEXT)")
-    c.execute("CREATE TABLE IF NOT EXISTS event_logs(id INTEGER PRIMARY KEY,event_type TEXT,name TEXT,game_name TEXT,host_id INT,guild_id INT,channel_id INT,message_id INT,start_ts TEXT,end_ts TEXT,attendees TEXT,no_shows TEXT)")
-    for col in ("log_channel_id", "log_message_id"):
-        try: c.execute(f"ALTER TABLE strikes ADD COLUMN {col} INTEGER")
-        except sqlite3.OperationalError: pass
+    tables = [
+        "CREATE TABLE IF NOT EXISTS levels(user_id INT,guild_id INT,xp INT,level INT,PRIMARY KEY(user_id,guild_id))",
+        "CREATE TABLE IF NOT EXISTS tags(name TEXT,guild_id INT,content TEXT,author_id INT,uses INT DEFAULT 0,created TEXT)",
+        "CREATE TABLE IF NOT EXISTS warns(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,reason TEXT,mod_id INT,ts TEXT)",
+        "CREATE TABLE IF NOT EXISTS strikes(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,reason TEXT,ts TEXT,mod_id INT,log_channel_id INT,log_message_id INT)",
+        "CREATE TABLE IF NOT EXISTS tempbans(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,expiry_timestamp TEXT)",
+        "CREATE TABLE IF NOT EXISTS applications(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,content TEXT,status TEXT DEFAULT 'pending',ts TEXT,message_id INT)",
+        "CREATE TABLE IF NOT EXISTS invites(id INTEGER PRIMARY KEY,inviter_id INT,invitee_id INT,guild_id INT,code TEXT,ts TEXT)",
+        "CREATE TABLE IF NOT EXISTS roblox_verify(user_id INT PRIMARY KEY,roblox_id INT,roblox_username TEXT,verified_ts TEXT)",
+        "CREATE TABLE IF NOT EXISTS tickets(id INTEGER PRIMARY KEY,guild_id INT,channel_id INT UNIQUE,user_id INT,claimer_id INT,status TEXT DEFAULT 'open',created_ts TEXT)",
+        "CREATE TABLE IF NOT EXISTS activity_checks(id INTEGER PRIMARY KEY,guild_id INT,message_id INT,channel_id INT,ts TEXT)",
+        "CREATE TABLE IF NOT EXISTS event_logs(id INTEGER PRIMARY KEY,event_type TEXT,name TEXT,game_name TEXT,host_id INT,guild_id INT,channel_id INT,message_id INT,start_ts TEXT,end_ts TEXT,attendees TEXT,no_shows TEXT)",
+    ]
+    for t in tables:
+        c.execute(pg_schema(t))
+    if not IS_PG:
+        for col in ("log_channel_id", "log_message_id"):
+            try: c.execute(f"ALTER TABLE strikes ADD COLUMN {col} INTEGER")
+            except sqlite3.OperationalError: pass
     conn.commit()
     conn.close()
 
