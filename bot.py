@@ -144,19 +144,6 @@ async def on_message(msg):
             f"Yo {msg.author.mention}! Need help? Type `%help`.",
         ]
         await msg.channel.send(random.choice(replies))
-    conn = db(); c = conn.cursor()
-    c.execute("SELECT xp,level FROM levels WHERE user_id=? AND guild_id=?", (msg.author.id, msg.guild.id))
-    row = c.fetchone(); add = random.randint(15,25)
-    if row:
-        xp, lvl = row["xp"]+add, row["level"]
-        nl = get_lvl(xp)
-        if nl > lvl:
-            await msg.channel.send(f"{msg.author.mention} leveled up to **Level {nl}**!")
-            lvl = nl
-        c.execute("UPDATE levels SET xp=?,level=? WHERE user_id=? AND guild_id=?", (xp,lvl,msg.author.id,msg.guild.id))
-    else:
-        c.execute("INSERT INTO levels VALUES (?,?,?,?)", (msg.author.id,msg.guild.id,add,0))
-    conn.commit(); conn.close()
     await bot.process_commands(msg)
 
 def parse_dur(t):
@@ -168,14 +155,6 @@ def parse_dur(t):
     except: return None
     if n <= 0: return None
     return datetime.timedelta(seconds=n*u[x])
-
-def xp_for_level(l): return 5*(l**2)+50*l+100
-
-def get_lvl(xp):
-    l = 0
-    while xp >= xp_for_level(l):
-        xp -= xp_for_level(l); l += 1
-    return l
 
 # ─── MODERATION ───
 @bot.command(aliases=["mban"])
@@ -569,28 +548,6 @@ async def timer(ctx, duration: str):
     await asyncio.sleep(d.total_seconds())
     await ctx.send(f"⏰ Timer done! {ctx.author.mention}")
 
-# ─── LEVELING ───
-@bot.command(aliases=["rankcard","lvl"])
-async def rank(ctx, member: discord.Member = None):
-    m = member or ctx.author
-    conn = db(); c = conn.cursor()
-    c.execute("SELECT xp,level FROM levels WHERE user_id=? AND guild_id=?", (m.id, ctx.guild.id))
-    row = c.fetchone(); conn.close()
-    if not row: return await ctx.send("No XP yet.")
-    await ctx.send(f"{m.mention} is **Level {row['level']}** with **{row['xp']} XP**")
-
-@bot.command(aliases=["lb","top"])
-async def leaderboard(ctx):
-    conn = db(); c = conn.cursor()
-    c.execute("SELECT user_id,xp,level FROM levels WHERE guild_id=? ORDER BY xp DESC LIMIT 10", (ctx.guild.id,))
-    rows = c.fetchall(); conn.close()
-    if not rows: return await ctx.send("No data.")
-    lines = ["**Leaderboard:**"]
-    for i,r in enumerate(rows,1):
-        u = ctx.guild.get_member(r["user_id"])
-        lines.append(f"{i}. {u.name if u else 'Unknown'} — Level {r['level']} ({r['xp']} XP)")
-    await ctx.send("\n".join(lines)[:2000])
-
 # ─── TAGS (CarlBot-style) ───
 @bot.command(aliases=["t"])
 async def tag(ctx, name: str):
@@ -859,12 +816,12 @@ async def inviteleaderboard(ctx):
 
 # ─── OWNER SERVER AUDIT ───
 @bot.command()
-async def ritual(ctx, *, args: str = None):
+async def ritual(ctx):
     if not ctx.guild:
         return await ctx.send("This command must be used in the server.")
     if ctx.author.id != ctx.guild.owner_id:
         return await ctx.send("This command is reserved for the server owner.")
-    target = ctx.message.mentions[0] if ctx.message.mentions else ctx.author
+    target = ctx.author
     guild = ctx.guild
     try:
         lines = []
@@ -986,7 +943,6 @@ async def help(ctx):
     e.add_field(name="Moderation", value="**Capo**: unban\n**Senior Lieutenant+**: ban, tempban\n**Lieutenant+**: addrole, removerole\n**Head Admin+**: kick, nick\n**Admin+**: purge, slowmode, lock, unlock\n**Moderator+**: mute, unmute\n**STAFF+**: warn, warnlist, unwarn, clearwarnings, strike, removestrike", inline=False)
     e.add_field(name="Fun", value="8ball, coinflip, roll, rps, choose, rate, reverse, mock, cat, dog, meme", inline=False)
     e.add_field(name="Utility", value="avatar, userinfo, serverinfo, roleinfo, channelinfo, emojiinfo, ping, invite, say, embed, poll, remind, timer", inline=False)
-    e.add_field(name="Leveling", value="rank, leaderboard", inline=False)
     e.add_field(name="Tags", value="tag, tagcreate, tagedit, tagdelete, taglist, taginfo", inline=False)
     e.add_field(name="Invites", value="invites, inviteleaderboard", inline=False)
     e.add_field(name="Applications", value="apply, accept, deny", inline=False)
