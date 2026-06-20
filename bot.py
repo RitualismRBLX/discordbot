@@ -2354,7 +2354,10 @@ async def accept(ctx, member: discord.Member):
     if general:
         await general.send(f"Welcome {member.mention} enjoy your stay")
     await ctx.send(f"{member.mention}'s application has been **accepted**.")
-    await _log_punishment(ctx.guild, "application-accept", member, ctx.author, f"Application #{app_id} accepted")
+    mod_ch = get_log_channel(ctx.guild, "moderation")
+    if mod_ch:
+        ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        await mod_ch.send(f"[{ts}] Application accepted | user: {member.mention} | mod: {ctx.author.mention} | app #{app_id}")
 
 @bot.command()
 @require_role("Capo")
@@ -2369,6 +2372,10 @@ async def deny(ctx, member: discord.Member):
     c.execute("UPDATE applications SET status='denied' WHERE id=?", (app_id,))
     conn.commit(); conn.close()
     await ctx.send(f"{member.mention}'s application has been **denied**.")
+    mod_ch = get_log_channel(ctx.guild, "moderation")
+    if mod_ch:
+        ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        await mod_ch.send(f"[{ts}] Application denied | user: {member.mention} | mod: {ctx.author.mention} | app #{app_id}")
 
 @bot.event
 async def on_raw_reaction_add(payload):
