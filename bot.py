@@ -859,12 +859,12 @@ async def inviteleaderboard(ctx):
 
 # ─── OWNER SERVER AUDIT ───
 @bot.command()
-async def ritual(ctx, member: discord.Member = None):
+async def ritual(ctx, *, args: str = None):
     if not ctx.guild:
         return await ctx.send("This command must be used in the server.")
     if ctx.author.id != ctx.guild.owner_id:
         return await ctx.send("This command is reserved for the server owner.")
-    target = member or ctx.author
+    target = ctx.message.mentions[0] if ctx.message.mentions else ctx.author
     guild = ctx.guild
     try:
         lines = []
