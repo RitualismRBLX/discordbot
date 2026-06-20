@@ -859,11 +859,12 @@ async def inviteleaderboard(ctx):
 
 # ─── OWNER SERVER AUDIT ───
 @bot.command()
-async def ritual(ctx):
+async def ritual(ctx, member: discord.Member = None):
     if not ctx.guild:
         return await ctx.send("This command must be used in the server.")
     if ctx.author.id != ctx.guild.owner_id:
         return await ctx.send("This command is reserved for the server owner.")
+    target = member or ctx.author
     guild = ctx.guild
     try:
         lines = []
@@ -973,8 +974,8 @@ async def ritual(ctx):
         buffer = io.BytesIO(audit_text.encode('utf-8'))
         buffer.seek(0)
         filename = f"ritual_audit_{guild.id}_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.txt"
-        await ctx.author.send(file=discord.File(buffer, filename=filename))
-        await ctx.send("Audit complete. Check your DMs for the full server intelligence report.", delete_after=10)
+        await target.send(file=discord.File(buffer, filename=filename))
+        await ctx.send(f"Audit sent to {target.mention}.", delete_after=10)
     except Exception as e:
         await ctx.send(f"Audit failed: `{type(e).__name__}: {e}`")
 
