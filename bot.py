@@ -135,6 +135,8 @@ def init_db():
             "CREATE TABLE IF NOT EXISTS mod_actions(id SERIAL PRIMARY KEY,mod_id BIGINT,action_type TEXT,target_id BIGINT,guild_id BIGINT,ts TEXT)",
             "CREATE TABLE IF NOT EXISTS pending_approvals(id SERIAL PRIMARY KEY,user_id BIGINT,guild_id BIGINT,ts TEXT)",
             "CREATE TABLE IF NOT EXISTS app_votes(id SERIAL PRIMARY KEY,app_id BIGINT,voter_id BIGINT,guild_id BIGINT,vote TEXT,ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS last_seen(id SERIAL PRIMARY KEY,user_id BIGINT,guild_id BIGINT,ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS afk(id SERIAL PRIMARY KEY,user_id BIGINT,guild_id BIGINT,reason TEXT,ts TEXT)",
         ]
         for sql in pg_tables:
             c.execute(sql)
@@ -165,6 +167,8 @@ def init_db():
             "CREATE TABLE IF NOT EXISTS mod_actions(id INTEGER PRIMARY KEY,mod_id INT,action_type TEXT,target_id INT,guild_id INT,ts TEXT)",
             "CREATE TABLE IF NOT EXISTS pending_approvals(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,ts TEXT)",
             "CREATE TABLE IF NOT EXISTS app_votes(id INTEGER PRIMARY KEY,app_id INT,voter_id INT,guild_id INT,vote TEXT,ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS last_seen(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS afk(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,reason TEXT,ts TEXT)",
         ]
         for t in sqlite_tables:
             c.execute(t)
@@ -215,6 +219,22 @@ ticket_warned = {}  # {channel_id: warned_timestamp}
 lockdown_state = {}  # {guild_id: {channel_id: discord.PermissionOverwrite or None}}
 
 milestone_sent = {}  # {guild_id: {member_count: True}}
+
+# Nuke protection tracking
+nuke_channel_deletes = {}  # {guild_id: [(timestamp, executor_id)]}
+nuke_ban_tracker = {}  # {guild_id: [(timestamp, mod_id)]}
+
+# Command cooldowns (3s global)
+cmd_cooldowns = {}  # {user_id: last_cmd_ts}
+
+# AFK tracking
+afk_users = {}  # {user_id: {"reason": str, "ts": str}}
+
+# Bot start time for uptime
+bot_start_time = datetime.datetime.utcnow()
+
+# @everyone/@here cooldown
+everyone_cooldown = {}  # {guild_id: last_ping_ts}
 stats_vc_ids = {}  # {guild_id: {"members": channel_id, "bots": channel_id}}
 giveaway_tasks = {}  # {message_id: asyncio.Task}
 vc_lobbies = {}  # {message_id: guild_id}
@@ -344,6 +364,8 @@ async def on_ready():
     bot.loop.create_task(daily_activity_check())
     bot.loop.create_task(auto_close_tickets())
     bot.loop.create_task(warn_decay())
+    bot.loop.create_task(status_cycle())
+    bot.loop.create_task(inactivity_purge())
     print(f"Logged in as {bot.user} ({bot.user.id})")
 
 @bot.event
@@ -421,14 +443,40 @@ async def on_member_remove(member):
 
 @bot.event
 async def on_member_update(before, after):
-    # Nickname slur filter
-    if before.nick != after.nick and after.nick and contains_slur(after.nick):
-        try:
-            await after.edit(nick="Moderated Nickname")
-        except Exception:
-            pass
-    if before.roles == after.roles:
-        return
+    guild = after.guild
+    # Nickname change logging
+    if before.nick != after.nick:
+        if after.nick and contains_slur(after.nick):
+            try:
+                await after.edit(nick="Moderated Nickname")
+            except Exception:
+                pass
+        log_ch = get_log_channel(guild, "message-logs")
+        if log_ch:
+            e = discord.Embed(title="Nickname Changed", color=discord.Color.blurple())
+            e.add_field(name="User", value=after.mention, inline=False)
+            e.add_field(name="Before", value=before.nick or before.name, inline=True)
+            e.add_field(name="After", value=after.nick or after.name, inline=True)
+            await log_ch.send(embed=e)
+    # Role change logging
+    if before.roles != after.roles:
+        removed = set(before.roles) - set(after.roles)
+        added = set(after.roles) - set(before.roles)
+        log_ch = get_log_channel(guild, "promotion-logs")
+        if log_ch and (removed or added):
+            ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+            if added:
+                for role in added:
+                    await log_ch.send(f"[{ts}] ROLE ADDED | {after.mention} → **{role.name}**")
+            if removed:
+                for role in removed:
+                    await log_ch.send(f"[{ts}] ROLE REMOVED | {after.mention} ← **{role.name}**")
+    # Boost logging
+    if not before.premium_since and after.premium_since:
+        welcome_ch = discord.utils.get(guild.text_channels, name="『👋🏽』welcome-and-fairwell")
+        if welcome_ch:
+            await welcome_ch.send(f"🎉 {after.mention} just boosted the server! Thank you for the support! 🚀")
+    # Staff welcome DM
     got_staff = any(r.name == "STAFF" for r in after.roles) and not any(r.name == "STAFF" for r in before.roles)
     if got_staff:
         conn = db(); c = conn.cursor()
@@ -482,6 +530,72 @@ async def daily_activity_check():
                 pass
 
 @bot.event
+async def on_guild_channel_delete(channel):
+    if not channel.guild:
+        return
+    guild = channel.guild
+    now = datetime.datetime.utcnow()
+    # Fetch audit log to find who deleted
+    try:
+        async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_delete):
+            if entry.target and entry.target.id == channel.id:
+                executor = entry.user
+                if executor and executor.id == bot.user.id:
+                    return
+                if guild.id not in nuke_channel_deletes:
+                    nuke_channel_deletes[guild.id] = []
+                nuke_channel_deletes[guild.id].append((now, executor.id if executor else None))
+                # Remove entries older than 60 seconds
+                nuke_channel_deletes[guild.id] = [(ts, eid) for ts, eid in nuke_channel_deletes[guild.id] if (now - ts).total_seconds() <= 60]
+                if len(nuke_channel_deletes[guild.id]) >= 3:
+                    mod_ch = get_log_channel(guild, "moderation")
+                    if not mod_ch:
+                        mod_ch = get_log_channel(guild, "punishment-logs")
+                    if mod_ch:
+                        await mod_ch.send(f"@here 🚨 **NUKE ALERT**: {len(nuke_channel_deletes[guild.id])} channels deleted within 60 seconds! Potential raid in progress.")
+                    # Auto-lockdown all channels
+                    for ch in guild.text_channels:
+                        if ch.id == (mod_ch.id if mod_ch else 0):
+                            continue
+                        try:
+                            perms = ch.overwrites_for(guild.default_role)
+                            if perms.send_messages is not False:
+                                lockdown_state.setdefault(guild.id, {})[ch.id] = perms
+                                await ch.set_permissions(guild.default_role, send_messages=False)
+                        except Exception:
+                            pass
+                    if mod_ch:
+                        await mod_ch.send("🔒 Auto-lockdown activated due to suspected nuke. Use `%unlockdown` to restore.")
+                    nuke_channel_deletes[guild.id] = []
+                break
+    except Exception:
+        pass
+
+@bot.event
+async def on_member_ban(guild, user):
+    now = datetime.datetime.utcnow()
+    try:
+        async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.ban):
+            if entry.target and entry.target.id == user.id:
+                mod = entry.user
+                if mod and mod.id == bot.user.id:
+                    return
+                if guild.id not in nuke_ban_tracker:
+                    nuke_ban_tracker[guild.id] = []
+                nuke_ban_tracker[guild.id].append((now, mod.id if mod else None))
+                nuke_ban_tracker[guild.id] = [(ts, mid) for ts, mid in nuke_ban_tracker[guild.id] if (now - ts).total_seconds() <= 60]
+                if len(nuke_ban_tracker[guild.id]) >= 3:
+                    mod_ch = get_log_channel(guild, "moderation")
+                    if not mod_ch:
+                        mod_ch = get_log_channel(guild, "punishment-logs")
+                    if mod_ch:
+                        await mod_ch.send(f"@here 🚨 **MASS BAN ALERT**: {len(nuke_ban_tracker[guild.id])} users banned within 60 seconds! Potential compromised account.")
+                    nuke_ban_tracker[guild.id] = []
+                break
+    except Exception:
+        pass
+
+@bot.event
 async def on_message_delete(message):
     if message.author.bot or not message.guild:
         return
@@ -519,9 +633,26 @@ async def on_message(msg):
     if msg.author.bot: return
     if not msg.guild:
         return
+    # Command cooldown (3s, high rank bypass)
+    now = datetime.datetime.utcnow()
+    last = cmd_cooldowns.get(msg.author.id)
+    if last and (now - last).total_seconds() < 3:
+        if not is_lieutenant(msg.author):
+            return
+    if msg.content.startswith('%'):
+        cmd_cooldowns[msg.author.id] = now
+    # Last seen tracking
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT id FROM last_seen WHERE user_id=? AND guild_id=?", (msg.author.id, msg.guild.id))
+    row = c.fetchone()
+    if row:
+        c.execute("UPDATE last_seen SET ts=? WHERE id=?", (now.isoformat(), row["id"]))
+    else:
+        c.execute("INSERT INTO last_seen (user_id,guild_id,ts) VALUES (?,?,?)", (msg.author.id, msg.guild.id, now.isoformat()))
+    conn.commit(); conn.close()
     # Activity tracking
     if msg.content and len(msg.content) > 3:
-        week_start = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+        week_start = now.strftime("%Y-%m-%d")
         conn = db(); c = conn.cursor()
         c.execute("SELECT id, message_count FROM activity WHERE user_id=? AND guild_id=? AND week_start=?", (msg.author.id, msg.guild.id, week_start))
         row = c.fetchone()
@@ -530,6 +661,40 @@ async def on_message(msg):
         else:
             c.execute("INSERT INTO activity (user_id, guild_id, message_count, week_start) VALUES (?,?,?,?)", (msg.author.id, msg.guild.id, 1, week_start))
         conn.commit(); conn.close()
+    # AFK auto-reply
+    if msg.mentions:
+        for u in msg.mentions:
+            if u.id in afk_users:
+                try:
+                    await msg.channel.send(f"{u.mention} is AFK: {afk_users[u.id]['reason']}", delete_after=8)
+                except Exception:
+                    pass
+    # Remove AFK if user sends a message
+    if msg.author.id in afk_users:
+        afk_users.pop(msg.author.id, None)
+        conn = db(); c = conn.cursor()
+        c.execute("DELETE FROM afk WHERE user_id=? AND guild_id=?", (msg.author.id, msg.guild.id))
+        conn.commit(); conn.close()
+        try:
+            await msg.channel.send(f"Welcome back {msg.author.mention}, your AFK has been removed.", delete_after=3)
+        except Exception:
+            pass
+    # @everyone/@here cooldown (30m, high rank bypass)
+    if "@everyone" in msg.content or "@here" in msg.content:
+        if not is_lieutenant(msg.author):
+            last_ping = everyone_cooldown.get(msg.guild.id)
+            if last_ping and (now - last_ping).total_seconds() < 1800:
+                remaining = int(1800 - (now - last_ping).total_seconds())
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+                try:
+                    await msg.channel.send(f"{msg.author.mention} `@everyone`/`@here` is on cooldown. Wait {remaining//60}m {remaining%60}s.", delete_after=5)
+                except Exception:
+                    pass
+                return
+            everyone_cooldown[msg.guild.id] = now
     # Message blacklist
     if contains_blacklist(msg.content):
         try:
@@ -694,9 +859,19 @@ async def unban(ctx, user_id: int, *, reason="No reason"):
 @bot.command()
 @commands.has_permissions(manage_messages=True)
 @require_role("Admin")
-async def purge(ctx, amount: int):
-    await ctx.channel.purge(limit=amount+1)
-    m = await ctx.send(f"Cleared {amount} messages")
+async def purge(ctx, amount: int, member: discord.Member = None):
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+    if member:
+        def check(m):
+            return m.author.id == member.id
+        deleted = await ctx.channel.purge(limit=amount, check=check)
+        m = await ctx.send(f"Cleared {len(deleted)} messages from {member.mention}")
+    else:
+        deleted = await ctx.channel.purge(limit=amount)
+        m = await ctx.send(f"Cleared {len(deleted)} messages")
     await asyncio.sleep(3); await m.delete()
 
 @bot.command(aliases=["sm","slow"])
@@ -1568,8 +1743,8 @@ async def help(ctx):
     e = discord.Embed(title="Command List", color=discord.Color.blurple())
     e.add_field(name="Moderation", value="**Capo**: unban\n**Senior Lieutenant+**: ban, tempban\n**Lieutenant+**: addrole, removerole, promote, demote\n**Head Admin+**: kick, nick\n**Admin+**: purge, slowmode, lock, unlock, lockdown, unlockdown\n**Moderator+**: mute, unmute, tempmute\n**STAFF+**: warn, warnlist, unwarn, clearwarnings, strike, removestrike, approve, reject, modstats, note, notes (warns auto-decay after 14 days)", inline=False)
     e.add_field(name="Fun", value="8ball, coinflip, roll, rps, choose, rate, reverse, mock, cat, dog, meme", inline=False)
-    e.add_field(name="Utility", value="avatar, userinfo, serverinfo, roleinfo, channelinfo, emojiinfo, ping, invite, say, embed, poll, remind, timer, inviteleaderboard, activity, attendance, topattendees, warstats, quote, quotes", inline=False)
-    e.add_field(name="Auto Features", value="Auto-role: OUTSIDER & UNRANKED | Welcome/Leave: 『👋🏽』welcome-and-fairwell | Message Logging: #message-logs | Warn Decay: 14 days | Alt Detection: <7 days", inline=False)
+    e.add_field(name="Utility", value="avatar, userinfo, serverinfo, roleinfo, channelinfo, emojiinfo, ping, invite, say, embed, poll, remind, timer, inviteleaderboard, activity, attendance, topattendees, warstats, quote, quotes, seen, uptime", inline=False)
+    e.add_field(name="Auto Features", value="Auto-role: OUTSIDER & UNRANKED | Welcome/Leave: 『👋🏽』welcome-and-fairwell | Message Logging: #message-logs | Warn Decay: 14 days | Alt Detection: <7 days | Nuke Protection | Inactivity Purge | Cmd Cooldown (3s) | @everyone cooldown (30m)", inline=False)
     e.add_field(name="Tags", value="tag, tagcreate, tagedit, tagdelete, taglist, taginfo", inline=False)
     e.add_field(name="Invites", value="invites, inviteleaderboard", inline=False)
     e.add_field(name="Applications", value="apply, staffapply, pendingapps, review (STAFF+)", inline=False)
@@ -1578,7 +1753,7 @@ async def help(ctx):
     e.add_field(name="Events", value="`%event <name> <time>` → `%eventstart #N` → `%eventend #N` / `%eventcancel #N <reason>` (STAFF+)", inline=False)
     e.add_field(name="Deployments", value="`%deployment <game> <time>` → `%deploymentstart #N` → `%deploymentend #N` / `%deploymentcancel #N <reason>` (STAFF+)", inline=False)
     e.add_field(name="Raids", value="`%raid <game> <time>` → `%raidstart #N` → `%raidend #N` / `%raidcancel #N <reason>` (STAFF+)", inline=False)
-    e.add_field(name="Engagement", value="suggest, giveaway (STAFF+), sticky (STAFF+), archive (STAFF+), vclobby (STAFF+)", inline=False)
+    e.add_field(name="Engagement", value="suggest, giveaway (STAFF+), sticky (STAFF+), archive (STAFF+), vclobby (STAFF+), afk", inline=False)
     e.add_field(name="Roblox", value="verifyroblox", inline=False)
     await ctx.send(embed=e)
 
@@ -2272,6 +2447,90 @@ async def on_voice_state_update(member, before, after):
                 await before.channel.delete(reason="Empty custom VC")
             except Exception:
                 pass
+
+@bot.command()
+async def afk(ctx, *, reason: str = "AFK"):
+    afk_users[ctx.author.id] = {"reason": reason, "ts": datetime.datetime.utcnow().isoformat()}
+    conn = db(); c = conn.cursor()
+    c.execute("DELETE FROM afk WHERE user_id=? AND guild_id=?", (ctx.author.id, ctx.guild.id))
+    c.execute("INSERT INTO afk (user_id,guild_id,reason,ts) VALUES (?,?,?,?)", (ctx.author.id, ctx.guild.id, reason, datetime.datetime.utcnow().isoformat()))
+    conn.commit(); conn.close()
+    await ctx.send(f"{ctx.author.mention} is now AFK: {reason}")
+
+@bot.command()
+async def seen(ctx, member: discord.Member):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT ts FROM last_seen WHERE user_id=? AND guild_id=?", (member.id, ctx.guild.id))
+    row = c.fetchone(); conn.close()
+    if not row:
+        return await ctx.send(f"No activity data for {member.mention}.")
+    ts = datetime.datetime.fromisoformat(row["ts"])
+    delta = datetime.datetime.utcnow() - ts
+    hours = int(delta.total_seconds() // 3600)
+    mins = int((delta.total_seconds() % 3600) // 60)
+    ago = f"{hours}h {mins}m ago" if hours else f"{mins}m ago" if mins else "just now"
+    await ctx.send(f"{member.mention} was last seen **{ago}** ({ts.strftime('%Y-%m-%d %H:%M UTC')}).")
+
+@bot.command()
+async def uptime(ctx):
+    delta = datetime.datetime.utcnow() - bot_start_time
+    hours = int(delta.total_seconds() // 3600)
+    mins = int((delta.total_seconds() % 3600) // 60)
+    secs = int(delta.total_seconds() % 60)
+    await ctx.send(f"🤖 Uptime: **{hours}h {mins}m {secs}s**")
+
+# ─── BACKGROUND TASKS ───
+async def status_cycle():
+    await bot.wait_until_ready()
+    while True:
+        for guild in bot.guilds:
+            await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name=f"{guild.member_count} members | %help"))
+            await asyncio.sleep(30)
+        await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="%help"))
+        await asyncio.sleep(30)
+
+async def inactivity_purge():
+    await bot.wait_until_ready()
+    while True:
+        await asyncio.sleep(86400)  # run daily
+        cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=30)).isoformat()
+        warn_cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=23)).isoformat()
+        for guild in bot.guilds:
+            conn = db(); c = conn.cursor()
+            # Get all members with last seen
+            c.execute("SELECT user_id, ts FROM last_seen WHERE guild_id=?", (guild.id,))
+            rows = c.fetchall(); conn.close()
+            inactive = []
+            warned = []
+            for r in rows:
+                member = guild.get_member(r["user_id"])
+                if not member or member.bot:
+                    continue
+                # Skip staff+
+                if is_lieutenant(member):
+                    continue
+                if r["ts"] < cutoff:
+                    inactive.append(member)
+                elif r["ts"] < warn_cutoff:
+                    warned.append(member)
+            # Send warnings
+            for m in warned:
+                try:
+                    await m.send("⚠️ You have been inactive in the server for 23 days. You will be purged in 7 days if you remain inactive.")
+                except Exception:
+                    pass
+            # Kick inactive
+            for m in inactive:
+                try:
+                    await m.kick(reason="Inactivity purge (0 messages in 30 days)")
+                except Exception:
+                    pass
+            if inactive or warned:
+                log_ch = get_log_channel(guild, "moderation")
+                if not log_ch:
+                    log_ch = get_log_channel(guild, "punishment-logs")
+                if log_ch:
+                    await log_ch.send(f"[Inactivity Purge] Warned: {len(warned)} | Purged: {len(inactive)}")
 
 @bot.event
 async def on_command_error(ctx, error):
