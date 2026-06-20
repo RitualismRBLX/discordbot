@@ -1283,6 +1283,24 @@ async def help(ctx):
     e.add_field(name="Roblox", value="verifyroblox", inline=False)
     await ctx.send(embed=e)
 
+@bot.command()
+async def dbstatus(ctx):
+    if ctx.author.id != ctx.guild.owner_id:
+        return await ctx.send("Owner only.")
+    db_type = "PostgreSQL" if IS_PG else "SQLite (local file)"
+    e = discord.Embed(title="Database Status", color=discord.Color.green() if IS_PG else discord.Color.orange())
+    e.add_field(name="Type", value=db_type, inline=False)
+    try:
+        conn = db(); c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM warns")
+        n = c.fetchone()[0]
+        conn.close()
+        e.add_field(name="Connection", value="OK", inline=False)
+        e.add_field(name="Total Warns in DB", value=str(n), inline=False)
+    except Exception as err:
+        e.add_field(name="Connection", value=f"FAILED: `{err}`", inline=False)
+    await ctx.send(embed=e)
+
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CheckFailure):
