@@ -225,6 +225,35 @@ def parse_dur(t):
     if n <= 0: return None
     return datetime.timedelta(seconds=n*u[x])
 
+def parse_event_time(time_str):
+    time_str = time_str.strip()
+    now = datetime.datetime.utcnow()
+    # Check for relative duration like 15m, 2h, 1d
+    dur = parse_dur(time_str)
+    if dur:
+        dt = now + dur
+        return dt, int(dt.timestamp())
+    # Try parsing as absolute time (various formats)
+    # Try HH:MM format
+    try:
+        dt = datetime.datetime.strptime(time_str, "%H:%M")
+        dt = now.replace(hour=dt.hour, minute=dt.minute, second=0, microsecond=0)
+        if dt <= now:
+            dt += datetime.timedelta(days=1)
+        return dt, int(dt.timestamp())
+    except ValueError:
+        pass
+    # Try H:MM AM/PM format (e.g. "10:30 PM")
+    try:
+        dt = datetime.datetime.strptime(time_str.upper(), "%I:%M %p")
+        dt = now.replace(hour=dt.hour, minute=dt.minute, second=0, microsecond=0)
+        if dt <= now:
+            dt += datetime.timedelta(days=1)
+        return dt, int(dt.timestamp())
+    except ValueError:
+        pass
+    return None, None
+
 # ─── MODERATION ───
 @bot.command(aliases=["mban"])
 @commands.has_permissions(ban_members=True)
@@ -991,13 +1020,17 @@ async def _post_announcement(ctx, event_type, name, game_name, time_str, target_
     row = c.fetchone(); conn.close()
     if not row or not row["roblox_id"]:
         return await ctx.send("You must verify your Roblox profile first. Use `%verifyroblox <your_roblox_id>`.")
+    dt, unix_ts = parse_event_time(time_str)
+    if not dt:
+        return await ctx.send("Invalid time format. Use relative like `15m`, `2h`, `1d` or absolute like `22:30` or `10:30 PM`.")
     roblox_id = row["roblox_id"]
     roblox_link = f"https://www.roblox.com/users/{roblox_id}/profile"
     e = discord.Embed(title=f"{'EVENT' if event_type=='event' else event_type.upper()}: {name}", color=discord.Color.red())
     e.add_field(name="Host", value=ctx.author.mention, inline=False)
     if game_name:
         e.add_field(name="Game", value=game_name, inline=False)
-    e.add_field(name="Time", value=time_str, inline=False)
+    # Discord timestamps auto-convert to viewer's local timezone
+    e.add_field(name="Starts", value=f"<t:{unix_ts}:F> (<t:{unix_ts}:R>)", inline=False)
     e.add_field(name="RSVP", value="React with ✅ to confirm attendance.", inline=False)
     e.set_footer(text=f"Host Roblox: {roblox_link}")
     msg = await ch.send("@everyone", embed=e)
@@ -1010,7 +1043,9 @@ async def _post_announcement(ctx, event_type, name, game_name, time_str, target_
         "guild_id": ctx.guild.id,
         "reactors": set(),
         "channel_id": ch.id,
-        "start_ts": datetime.datetime.utcnow().isoformat()
+        "start_ts": datetime.datetime.utcnow().isoformat(),
+        "event_time": dt.isoformat(),
+        "unix_ts": unix_ts
     }
     await ctx.send(f"{event_type.upper()} posted in {ch.mention}.")
 
@@ -1084,7 +1119,8 @@ async def _end_event(ctx, event_type):
                 asyncio.create_task(_delayed_unban(ctx.guild, user_id, expiry, 7*24*60*60))
             except Exception:
                 pass
-    log_ch = get_log_channel(ctx.guild, "deployment-event-logs")
+    log_map = {"event": "event-logs", "deployment": "deployment-logs", "raid": "deployment-logs"}
+    log_ch = get_log_channel(ctx.guild, log_map.get(event_type, "deployment-logs"))
     if log_ch:
         e = discord.Embed(title=f"{event_type.upper()} Ended: {ev['name']}", color=discord.Color.blue())
         e.add_field(name="Host", value=f"<@{ev['host_id']}>", inline=False)
