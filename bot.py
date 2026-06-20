@@ -197,7 +197,13 @@ async def _delayed_unban(guild, user_id, expiry_str, delay):
     c.execute("SELECT 1 FROM tempbans WHERE user_id=? AND guild_id=? AND expiry_timestamp=?", (user_id, guild.id, expiry_str))
     if not c.fetchone():
         conn.close(); return
-    try: await guild.unban(discord.Object(id=user_id), reason="Tempban expired")
+    try:
+        await guild.unban(discord.Object(id=user_id), reason="Tempban expired")
+        log_ch = get_log_channel(guild, "punishment-logs")
+        if log_ch:
+            ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+            user = await bot.fetch_user(user_id)
+            await log_ch.send(f"[{ts}] action; auto-unban (tempban expired) | user; {user.mention if user else user_id}")
     except Exception: pass
     c.execute("DELETE FROM tempbans WHERE user_id=? AND guild_id=?", (user_id, guild.id))
     conn.commit(); conn.close()
@@ -209,7 +215,13 @@ async def check_tempbans():
     for user_id, guild_id in c.fetchall():
         guild = bot.get_guild(guild_id)
         if guild:
-            try: await guild.unban(discord.Object(id=user_id), reason="Tempban expired")
+            try:
+                await guild.unban(discord.Object(id=user_id), reason="Tempban expired")
+                log_ch = get_log_channel(guild, "punishment-logs")
+                if log_ch:
+                    ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+                    user = await bot.fetch_user(user_id)
+                    await log_ch.send(f"[{ts}] action; auto-unban (tempban expired) | user; {user.mention if user else user_id}")
             except Exception: pass
     c.execute("DELETE FROM tempbans WHERE expiry_timestamp <= ?", (now.isoformat(),))
     conn.commit()
@@ -375,11 +387,20 @@ def parse_event_time(time_str):
     return None, None
 
 # ─── MODERATION ───
+async def _log_punishment(guild, action, member, mod, reason=""):
+    log_ch = get_log_channel(guild, "punishment-logs")
+    if not log_ch:
+        return
+    ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    r = f" | reason; {reason}" if reason else ""
+    await log_ch.send(f"[{ts}] action; {action} | user; {member.mention} | mod; {mod.mention}{r}")
+
 @bot.command(aliases=["mban"])
 @commands.has_permissions(ban_members=True)
 @require_role("Lieutenant")
 async def ban(ctx, member: discord.Member, *, reason="No reason"):
     await member.ban(reason=reason)
+    await _log_punishment(ctx.guild, "ban", member, ctx.author, reason)
     await ctx.send(f"Banned {member.mention}. `{reason}`")
 
 @bot.command(aliases=["mkick"])
@@ -387,6 +408,7 @@ async def ban(ctx, member: discord.Member, *, reason="No reason"):
 @require_role("Head Admin")
 async def kick(ctx, member: discord.Member, *, reason="No reason"):
     await member.kick(reason=reason)
+    await _log_punishment(ctx.guild, "kick", member, ctx.author, reason)
     await ctx.send(f"Kicked {member.mention}. `{reason}`")
 
 @bot.command(aliases=["mmute"])
@@ -397,6 +419,7 @@ async def mute(ctx, member: discord.Member, duration: str = "1h", *, reason="No 
     if d is None: return await ctx.send("Invalid duration. Use `1h`, `30m`, `1d`, etc.")
     if d > datetime.timedelta(days=28): return await ctx.send("Max 28 days.")
     await member.timeout(d, reason=reason)
+    await _log_punishment(ctx.guild, f"mute ({duration})", member, ctx.author, reason)
     await ctx.send(f"Muted {member.mention} for `{duration}`. `{reason}`")
 
 @bot.command(aliases=["munmute"])
@@ -404,6 +427,7 @@ async def mute(ctx, member: discord.Member, duration: str = "1h", *, reason="No 
 @require_role("Moderator")
 async def unmute(ctx, member: discord.Member, *, reason="No reason"):
     await member.timeout(None, reason=reason)
+    await _log_punishment(ctx.guild, "unmute", member, ctx.author, reason)
     await ctx.send(f"Unmuted {member.mention}.")
 
 @bot.command(aliases=["mtb"])
@@ -413,10 +437,16 @@ async def tempban(ctx, member: discord.Member, duration: str, *, reason="No reas
     d = parse_dur(duration)
     if d is None: return await ctx.send("Invalid duration.")
     await member.ban(reason=f"Tempban ({duration}): {reason}")
+    await _log_punishment(ctx.guild, f"tempban ({duration})", member, ctx.author, reason)
     await ctx.send(f"Tempbanned {member.mention} for `{duration}`.")
     async def _unban():
         await asyncio.sleep(d.total_seconds())
-        try: await ctx.guild.unban(member, reason="Tempban expired")
+        try:
+            await ctx.guild.unban(member, reason="Tempban expired")
+            log_ch = get_log_channel(ctx.guild, "punishment-logs")
+            if log_ch:
+                ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+                await log_ch.send(f"[{ts}] action; auto-unban (tempban expired) | user; {member.mention}")
         except: pass
     asyncio.create_task(_unban())
 
@@ -427,6 +457,7 @@ async def unban(ctx, user_id: int, *, reason="No reason"):
     try:
         user = await bot.fetch_user(user_id)
         await ctx.guild.unban(user, reason=reason)
+        await _log_punishment(ctx.guild, "unban", user, ctx.author, reason)
         await ctx.send(f"Unbanned `{user}`. `{reason}`")
     except discord.NotFound:
         await ctx.send("User not banned or does not exist.")
@@ -497,6 +528,7 @@ async def warn(ctx, member: discord.Member, *, reason):
     conn.commit()
     c.execute("SELECT COUNT(*) FROM warns WHERE user_id=? AND guild_id=?", (member.id,ctx.guild.id))
     n = c.fetchone()[0]; conn.close()
+    await _log_punishment(ctx.guild, "warn", member, ctx.author, reason)
     await ctx.send(f"Warned {member.mention} (`{reason}`) — Total: {n}")
 
 @bot.command(aliases=["warns","warnings"])
@@ -516,8 +548,15 @@ async def warnlist(ctx, member: discord.Member):
 @require_role("STAFF")
 async def unwarn(ctx, member: discord.Member):
     conn = db(); c = conn.cursor()
-    c.execute("DELETE FROM warns WHERE id=(SELECT id FROM warns WHERE user_id=? AND guild_id=? ORDER BY id DESC LIMIT 1)", (member.id,ctx.guild.id))
+    c.execute("SELECT id, reason FROM warns WHERE user_id=? AND guild_id=? ORDER BY id DESC LIMIT 1", (member.id,ctx.guild.id))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return await ctx.send("No warnings found for this user.")
+    wid, reason = row
+    c.execute("DELETE FROM warns WHERE id=?", (wid,))
     conn.commit(); conn.close()
+    await _log_punishment(ctx.guild, "unwarn (revert)", member, ctx.author, reason)
     await ctx.send(f"Removed 1 warning from {member.mention}")
 
 @bot.command(aliases=["clearwarns"])
@@ -525,8 +564,11 @@ async def unwarn(ctx, member: discord.Member):
 @require_role("STAFF")
 async def clearwarnings(ctx, member: discord.Member):
     conn = db(); c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM warns WHERE user_id=? AND guild_id=?", (member.id,ctx.guild.id))
+    n = c.fetchone()[0]
     c.execute("DELETE FROM warns WHERE user_id=? AND guild_id=?", (member.id,ctx.guild.id))
     conn.commit(); conn.close()
+    await _log_punishment(ctx.guild, f"clearwarnings ({n} removed)", member, ctx.author, "")
     await ctx.send(f"Cleared all warnings for {member.mention}")
 
 @bot.command(aliases=["mstrike"])
@@ -547,7 +589,8 @@ async def strike(ctx, member: discord.Member, *, reason: str):
     log_ch = get_log_channel(ctx.guild, "punishment-logs")
     log_msg = None
     if log_ch:
-        log_msg = await log_ch.send(f"user; <@{member.id}>\nstrike; {count}/3\nreason; {reason}")
+        ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        log_msg = await log_ch.send(f"[{ts}] action; strike ({count}/3) | user; {member.mention} | mod; {ctx.author.mention} | reason; {reason}")
         conn = db(); c = conn.cursor()
         c.execute("UPDATE strikes SET log_channel_id=?, log_message_id=? WHERE id=?", (log_ch.id, log_msg.id, sid))
         conn.commit(); conn.close()
@@ -559,7 +602,7 @@ async def strike(ctx, member: discord.Member, *, reason: str):
         try:
             await member.ban(reason="3 strikes - 7 day tempban")
             await ctx.send(f"{member.mention} reached **3 strikes** and was tempbanned for 7 days.")
-            if log_ch: await log_ch.send(f"user; <@{member.id}>\naction; tempban (7 days)\nreason; 3 strikes")
+            await _log_punishment(ctx.guild, "auto-tempban (3 strikes)", member, ctx.author, reason)
             asyncio.create_task(_delayed_unban(ctx.guild, member.id, expiry, 7*24*60*60))
         except discord.Forbidden:
             await ctx.send("Missing permissions to ban.")
@@ -582,6 +625,7 @@ async def removestrike(ctx, member: discord.Member):
     c.execute("SELECT COUNT(*) FROM strikes WHERE user_id=? AND guild_id=?", (member.id, ctx.guild.id))
     count = c.fetchone()[0]; conn.close()
     await ctx.send(f"Removed 1 strike from {member.mention}. Current strikes: {count}/3.")
+    await _log_punishment(ctx.guild, f"removestrike (revert) — was: {reason}", member, ctx.author, "")
     if lcid and lmid:
         try:
             ch = ctx.guild.get_channel(lcid)
