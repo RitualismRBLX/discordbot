@@ -138,9 +138,10 @@ def init_db():
         # Convert existing INT columns that store Discord IDs to BIGINT
         try:
             c.execute("SELECT table_name, column_name FROM information_schema.columns WHERE data_type = 'integer' AND column_name LIKE '%id'")
-            for row in c.fetchall():
+            rows_to_fix = list(c.fetchall())
+            for row in rows_to_fix:
                 try:
-                    c.execute(f"ALTER TABLE {row['table_name']} ALTER COLUMN {row['column_name']} TYPE BIGINT")
+                    c.execute(f"ALTER TABLE \"{row['table_name']}\" ALTER COLUMN \"{row['column_name']}\" TYPE BIGINT")
                 except Exception:
                     pass
         except Exception:
