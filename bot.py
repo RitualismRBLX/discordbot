@@ -27,6 +27,8 @@ class UnifiedRow:
             return list(self._row.values())[key] if hasattr(self._row, 'values') else self._row[key]
         return self._row[key]
     def __iter__(self):
+        if hasattr(self._row, 'values'):
+            return iter(self._row.values())
         return iter(self._row)
     def keys(self):
         return self._row.keys() if hasattr(self._row, 'keys') else []
