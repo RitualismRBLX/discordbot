@@ -1126,6 +1126,17 @@ async def rename(ctx, *, new_name):
     except discord.Forbidden:
         await ctx.send("Missing permissions to rename channel.")
 
+@bot.command()
+@require_role("STAFF")
+async def add(ctx, member: discord.Member):
+    if not ctx.channel.name.startswith("ticket-"):
+        return await ctx.send("This command only works in ticket channels.")
+    try:
+        await ctx.channel.set_permissions(member, view_channel=True, send_messages=True, read_message_history=True)
+        await ctx.send(f"Added {member.mention} to this ticket.")
+    except discord.Forbidden:
+        await ctx.send("Missing permissions to modify channel permissions.")
+
 # ─── WAR RANKS ───
 @bot.command()
 @require_role("Lieutenant")
@@ -1416,7 +1427,7 @@ async def help(ctx):
     e.add_field(name="Tags", value="tag, tagcreate, tagedit, tagdelete, taglist, taginfo", inline=False)
     e.add_field(name="Invites", value="invites, inviteleaderboard", inline=False)
     e.add_field(name="Applications", value="apply, accept, deny", inline=False)
-    e.add_field(name="Tickets", value="ticket, claim, rename", inline=False)
+    e.add_field(name="Tickets", value="ticket, claim, rename, add (STAFF+)", inline=False)
     e.add_field(name="War Ranks", value="warrank (Lieutenant+)", inline=False)
     e.add_field(name="Events", value="`%event <name> <time>` → `%eventstart #N` → `%eventend #N` / `%eventcancel #N <reason>` (STAFF+)", inline=False)
     e.add_field(name="Deployments", value="`%deployment <game> <time>` → `%deploymentstart #N` → `%deploymentend #N` / `%deploymentcancel #N <reason>` (STAFF+)", inline=False)
