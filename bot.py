@@ -1285,13 +1285,15 @@ async def _end_event(ctx, event_type):
                 asyncio.create_task(_delayed_unban(ctx.guild, user_id, expiry, 7*24*60*60))
             except Exception:
                 pass
-    log_map = {"event": "event-logs", "deployment": "deployment-event-logs", "raid": "deployment-event-logs"}
-    log_ch = get_log_channel(ctx.guild, log_map.get(event_type, "deployment-logs"))
+    log_ch = get_log_channel(ctx.guild, "deployment-event-logs")
     if log_ch:
-        e = discord.Embed(title=f"{event_type.upper()} Ended: {ev['name']}", color=discord.Color.blue())
-        e.add_field(name="Host", value=f"<@{ev['host_id']}>", inline=False)
-        e.add_field(name="Attendees", value=', '.join(f"<@{u}>" for u in attendees) or "None", inline=False)
-        e.add_field(name="No-Shows (Striked)", value=', '.join(f"<@{u}>" for u in no_shows) or "None", inline=False)
+        et_display = "Event" if event_type == "event" else event_type.capitalize()
+        title = f"{ev['name']} {et_display}"
+        lines = [f"• **Attended:** {', '.join(f'<@{u}>' for u in attendees) or 'None'}"]
+        if no_shows:
+            lines.append(f"• **No-Shows (Striked):** {', '.join(f'<@{u}>' for u in no_shows)}")
+        e = discord.Embed(title=title, color=discord.Color.blue())
+        e.description = "\n".join(lines)
         await log_ch.send(embed=e)
     conn = db(); c = conn.cursor()
     c.execute("INSERT INTO event_logs (event_type,name,game_name,host_id,guild_id,channel_id,message_id,start_ts,end_ts,attendees,no_shows) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
