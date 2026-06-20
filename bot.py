@@ -192,6 +192,9 @@ def _find_event_by_num(guild_id, num):
             return msg_id, ev
     return None, None
 
+ticket_warned = {}  # {channel_id: warned_timestamp}
+lockdown_state = {}  # {guild_id: {channel_id: discord.PermissionOverwrite or None}}
+
 def get_log_channel(guild, name): return discord.utils.get(guild.text_channels, name=name)
 
 async def _delayed_unban(guild, user_id, expiry_str, delay):
@@ -240,6 +243,62 @@ async def check_tempbans():
         except Exception: pass
     conn.close()
 
+async def auto_close_tickets():
+    await bot.wait_until_ready()
+    while True:
+        await asyncio.sleep(600)  # check every 10 minutes
+        now = datetime.datetime.utcnow()
+        conn = db(); c = conn.cursor()
+        c.execute("SELECT channel_id, guild_id FROM tickets WHERE status='open'")
+        rows = c.fetchall(); conn.close()
+        for channel_id, guild_id in rows:
+            ch = bot.get_channel(channel_id)
+            if not ch:
+                continue
+            try:
+                msgs = [m async for m in ch.history(limit=1)]
+                if not msgs:
+                    continue
+                last_msg = msgs[0]
+                inactivity = (now - last_msg.created_at.replace(tzinfo=None)).total_seconds()
+                if inactivity >= 24 * 3600:
+                    # Close ticket
+                    transcript = []
+                    async for m in ch.history(limit=500, oldest_first=True):
+                        ts = m.created_at.strftime("%Y-%m-%d %H:%M")
+                        transcript.append(f"[{ts}] {m.author.name}: {m.content}")
+                    transcript_text = "\n".join(transcript) or "No messages."
+                    log_ch = get_log_channel(ch.guild, "ticket-logs")
+                    if log_ch:
+                        e = discord.Embed(title=f"Ticket Closed (Inactivity) — #{ch.name}", color=discord.Color.orange())
+                        e.add_field(name="Transcript", value=transcript_text[:1000] + ("..." if len(transcript_text) > 1000 else ""), inline=False)
+                        await log_ch.send(embed=e)
+                    await ch.delete(reason="Auto-closed after 24h inactivity")
+                    ticket_warned.pop(channel_id, None)
+                    conn = db(); c = conn.cursor()
+                    c.execute("UPDATE tickets SET status='closed' WHERE channel_id=?", (channel_id,))
+                    conn.commit(); conn.close()
+                elif inactivity >= 23 * 3600 and channel_id not in ticket_warned:
+                    await ch.send("⚠️ This ticket will be closed in 1 hour due to inactivity.")
+                    ticket_warned[channel_id] = now.isoformat()
+            except Exception:
+                pass
+
+async def warn_decay():
+    await bot.wait_until_ready()
+    while True:
+        await asyncio.sleep(86400)  # run daily
+        cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=14)).isoformat()
+        conn = db(); c = conn.cursor()
+        c.execute("DELETE FROM warns WHERE ts <= ?", (cutoff,))
+        deleted = c.rowcount
+        conn.commit(); conn.close()
+        if deleted:
+            for guild in bot.guilds:
+                log_ch = get_log_channel(guild, "punishment-logs")
+                if log_ch:
+                    await log_ch.send(f"[{datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}] Auto-decay: {deleted} warn(s) older than 14 days removed.")
+
 async def cache_invites(guild):
     try:
         invs = await guild.invites()
@@ -254,6 +313,8 @@ async def on_ready():
     for guild in bot.guilds:
         await cache_invites(guild)
     bot.loop.create_task(daily_activity_check())
+    bot.loop.create_task(auto_close_tickets())
+    bot.loop.create_task(warn_decay())
     print(f"Logged in as {bot.user} ({bot.user.id})")
 
 @bot.event
@@ -342,6 +403,9 @@ async def on_message(msg):
     if msg.author.bot: return
     if not msg.guild:
         return
+    # Clear ticket inactivity warning if message sent in ticket channel
+    if msg.channel.name.startswith("ticket-") and msg.channel.id in ticket_warned:
+        ticket_warned.pop(msg.channel.id, None)
     if bot.user in msg.mentions and not msg.content.startswith('%'):
         replies = [
             f"Hey {msg.author.mention}! I'm a bot. Use `%help` to see what I can do.",
@@ -1137,6 +1201,41 @@ async def add(ctx, member: discord.Member):
     except discord.Forbidden:
         await ctx.send("Missing permissions to modify channel permissions.")
 
+@bot.command()
+@require_role("STAFF")
+async def remove(ctx, member: discord.Member):
+    if not ctx.channel.name.startswith("ticket-"):
+        return await ctx.send("This command only works in ticket channels.")
+    try:
+        await ctx.channel.set_permissions(member, overwrite=None)
+        await ctx.send(f"Removed {member.mention} from this ticket.")
+    except discord.Forbidden:
+        await ctx.send("Missing permissions to modify channel permissions.")
+
+@bot.command()
+@require_role("STAFF")
+async def close(ctx, *, reason="No reason provided"):
+    if not ctx.channel.name.startswith("ticket-"):
+        return await ctx.send("This command only works in ticket channels.")
+    ch = ctx.channel
+    transcript = []
+    async for m in ch.history(limit=500, oldest_first=True):
+        ts = m.created_at.strftime("%Y-%m-%d %H:%M")
+        transcript.append(f"[{ts}] {m.author.name}: {m.content}")
+    transcript_text = "\n".join(transcript) or "No messages."
+    log_ch = get_log_channel(ch.guild, "ticket-logs")
+    if log_ch:
+        e = discord.Embed(title=f"Ticket Closed — #{ch.name}", color=discord.Color.orange())
+        e.add_field(name="Closed by", value=ctx.author.mention, inline=False)
+        e.add_field(name="Reason", value=reason, inline=False)
+        e.add_field(name="Transcript", value=transcript_text[:1000] + ("..." if len(transcript_text) > 1000 else ""), inline=False)
+        await log_ch.send(embed=e)
+    conn = db(); c = conn.cursor()
+    c.execute("UPDATE tickets SET status='closed' WHERE channel_id=?", (ch.id,))
+    conn.commit(); conn.close()
+    ticket_warned.pop(ch.id, None)
+    await ch.delete(reason=f"Ticket closed by {ctx.author}: {reason}")
+
 # ─── WAR RANKS ───
 @bot.command()
 @require_role("Lieutenant")
@@ -1174,6 +1273,46 @@ async def warrank(ctx, member: discord.Member, *, rank: str):
         await ctx.send(f"Assigned **{role_name}** to {member.mention}.")
     except discord.Forbidden:
         await ctx.send("Missing permissions to assign role.")
+
+# ─── LOCKDOWN ───
+@bot.command()
+@require_role("STAFF")
+async def lockdown(ctx):
+    guild = ctx.guild
+    locked = []
+    for ch in guild.text_channels:
+        if ch.id == ctx.channel.id:
+            continue
+        overwrite = ch.overwrites_for(guild.default_role)
+        prev = discord.PermissionOverwrite()
+        prev.send_messages = overwrite.send_messages
+        if lockdown_state.get(guild.id) is None:
+            lockdown_state[guild.id] = {}
+        lockdown_state[guild.id][ch.id] = prev
+        try:
+            await ch.set_permissions(guild.default_role, send_messages=False)
+            locked.append(ch.mention)
+        except Exception:
+            pass
+    await ctx.send(f"Lockdown activated in {len(locked)} channel(s). Use `%unlockdown` to restore.")
+
+@bot.command()
+@require_role("STAFF")
+async def unlockdown(ctx):
+    guild = ctx.guild
+    restored = []
+    if guild.id not in lockdown_state:
+        return await ctx.send("No active lockdown to restore.")
+    for ch_id, prev in lockdown_state[guild.id].items():
+        ch = guild.get_channel(ch_id)
+        if ch:
+            try:
+                await ch.set_permissions(guild.default_role, overwrite=prev if prev.send_messages is not None else None)
+                restored.append(ch.mention)
+            except Exception:
+                pass
+    lockdown_state.pop(guild.id, None)
+    await ctx.send(f"Lockdown lifted in {len(restored)} channel(s).")
 
 # ─── ROBLOX VERIFICATION ───
 @bot.command()
@@ -1421,13 +1560,13 @@ async def raidcancel(ctx, number: str, *, reason: str):
 @bot.command()
 async def help(ctx):
     e = discord.Embed(title="Command List", color=discord.Color.blurple())
-    e.add_field(name="Moderation", value="**Capo**: unban\n**Senior Lieutenant+**: ban, tempban\n**Lieutenant+**: addrole, removerole\n**Head Admin+**: kick, nick\n**Admin+**: purge, slowmode, lock, unlock\n**Moderator+**: mute, unmute\n**STAFF+**: warn, warnlist, unwarn, clearwarnings, strike, removestrike", inline=False)
+    e.add_field(name="Moderation", value="**Capo**: unban\n**Senior Lieutenant+**: ban, tempban\n**Lieutenant+**: addrole, removerole\n**Head Admin+**: kick, nick\n**Admin+**: purge, slowmode, lock, unlock, lockdown, unlockdown\n**Moderator+**: mute, unmute\n**STAFF+**: warn, warnlist, unwarn, clearwarnings, strike, removestrike (warns auto-decay after 14 days)", inline=False)
     e.add_field(name="Fun", value="8ball, coinflip, roll, rps, choose, rate, reverse, mock, cat, dog, meme", inline=False)
     e.add_field(name="Utility", value="avatar, userinfo, serverinfo, roleinfo, channelinfo, emojiinfo, ping, invite, say, embed, poll, remind, timer", inline=False)
     e.add_field(name="Tags", value="tag, tagcreate, tagedit, tagdelete, taglist, taginfo", inline=False)
     e.add_field(name="Invites", value="invites, inviteleaderboard", inline=False)
     e.add_field(name="Applications", value="apply, accept, deny", inline=False)
-    e.add_field(name="Tickets", value="ticket, claim, rename, add (STAFF+)", inline=False)
+    e.add_field(name="Tickets", value="ticket, claim, rename, add, remove, close (STAFF+)", inline=False)
     e.add_field(name="War Ranks", value="warrank (Lieutenant+)", inline=False)
     e.add_field(name="Events", value="`%event <name> <time>` → `%eventstart #N` → `%eventend #N` / `%eventcancel #N <reason>` (STAFF+)", inline=False)
     e.add_field(name="Deployments", value="`%deployment <game> <time>` → `%deploymentstart #N` → `%deploymentend #N` / `%deploymentcancel #N <reason>` (STAFF+)", inline=False)
