@@ -107,52 +107,53 @@ def db():
     conn.row_factory = sqlite3.Row
     return UnifiedConn(conn, False)
 
-def pg_schema(sql_str):
-    if not IS_PG:
-        return sql_str
-    return (sql_str
-        .replace("INTEGER PRIMARY KEY", "SERIAL PRIMARY KEY")
-        .replace("INT PRIMARY KEY", "BIGINT PRIMARY KEY")
-        .replace(" INT ", " BIGINT ")
-        .replace(" INT)", " BIGINT)"))
-
 def init_db():
     conn = db()
     c = conn.cursor()
-    tables = [
-        "CREATE TABLE IF NOT EXISTS levels(user_id INT,guild_id INT,xp INT,level INT,PRIMARY KEY(user_id,guild_id))",
-        "CREATE TABLE IF NOT EXISTS tags(name TEXT,guild_id INT,content TEXT,author_id INT,uses INT DEFAULT 0,created TEXT)",
-        "CREATE TABLE IF NOT EXISTS warns(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,reason TEXT,mod_id INT,ts TEXT)",
-        "CREATE TABLE IF NOT EXISTS strikes(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,reason TEXT,ts TEXT,mod_id INT,log_channel_id INT,log_message_id INT)",
-        "CREATE TABLE IF NOT EXISTS tempbans(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,expiry_timestamp TEXT)",
-        "CREATE TABLE IF NOT EXISTS applications(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,content TEXT,status TEXT DEFAULT 'pending',ts TEXT,message_id INT)",
-        "CREATE TABLE IF NOT EXISTS invites(id INTEGER PRIMARY KEY,inviter_id INT,invitee_id INT,guild_id INT,code TEXT,ts TEXT)",
-        "CREATE TABLE IF NOT EXISTS roblox_verify(user_id INT PRIMARY KEY,roblox_id INT,roblox_username TEXT,verified_ts TEXT)",
-        "CREATE TABLE IF NOT EXISTS tickets(id INTEGER PRIMARY KEY,guild_id INT,channel_id INT UNIQUE,user_id INT,claimer_id INT,status TEXT DEFAULT 'open',created_ts TEXT)",
-        "CREATE TABLE IF NOT EXISTS activity_checks(id INTEGER PRIMARY KEY,guild_id INT,message_id INT,channel_id INT,ts TEXT)",
-        "CREATE TABLE IF NOT EXISTS event_logs(id INTEGER PRIMARY KEY,event_type TEXT,name TEXT,game_name TEXT,host_id INT,guild_id INT,channel_id INT,message_id INT,start_ts TEXT,end_ts TEXT,attendees TEXT,no_shows TEXT)",
-    ]
-    for t in tables:
-        c.execute(pg_schema(t))
     if IS_PG:
-        # Force-fix roblox_verify (no critical data yet, just drop and recreate with BIGINT)
-        try:
-            c.execute("DROP TABLE IF EXISTS roblox_verify")
-            c.execute("CREATE TABLE roblox_verify(user_id BIGINT PRIMARY KEY,roblox_id BIGINT,roblox_username TEXT,verified_ts TEXT)")
-        except Exception:
-            pass
-        # Fix other tables with USING clause
-        try:
-            c.execute("SELECT table_name, column_name FROM information_schema.columns WHERE table_schema='public' AND data_type='integer' AND column_name LIKE '%id'")
-            rows_to_fix = list(c.fetchall())
-            for row in rows_to_fix:
-                try:
-                    c.execute(f'ALTER TABLE "{row["table_name"]}" ALTER COLUMN "{row["column_name"]}" TYPE BIGINT USING "{row["column_name"]}"::bigint')
-                except Exception:
-                    pass
-        except Exception:
-            pass
-    if not IS_PG:
+        # PostgreSQL: all Discord ID columns must be BIGINT. Drop and recreate cleanly.
+        pg_tables = [
+            "DROP TABLE IF EXISTS event_logs CASCADE",
+            "DROP TABLE IF EXISTS activity_checks CASCADE",
+            "DROP TABLE IF EXISTS tickets CASCADE",
+            "DROP TABLE IF EXISTS roblox_verify CASCADE",
+            "DROP TABLE IF EXISTS invites CASCADE",
+            "DROP TABLE IF EXISTS applications CASCADE",
+            "DROP TABLE IF EXISTS tempbans CASCADE",
+            "DROP TABLE IF EXISTS strikes CASCADE",
+            "DROP TABLE IF EXISTS warns CASCADE",
+            "DROP TABLE IF EXISTS tags CASCADE",
+            "DROP TABLE IF EXISTS levels CASCADE",
+            "CREATE TABLE levels(user_id BIGINT,guild_id BIGINT,xp BIGINT,level BIGINT,PRIMARY KEY(user_id,guild_id))",
+            "CREATE TABLE tags(name TEXT,guild_id BIGINT,content TEXT,author_id BIGINT,uses BIGINT DEFAULT 0,created TEXT)",
+            "CREATE TABLE warns(id SERIAL PRIMARY KEY,user_id BIGINT,guild_id BIGINT,reason TEXT,mod_id BIGINT,ts TEXT)",
+            "CREATE TABLE strikes(id SERIAL PRIMARY KEY,user_id BIGINT,guild_id BIGINT,reason TEXT,ts TEXT,mod_id BIGINT,log_channel_id BIGINT,log_message_id BIGINT)",
+            "CREATE TABLE tempbans(id SERIAL PRIMARY KEY,user_id BIGINT,guild_id BIGINT,expiry_timestamp TEXT)",
+            "CREATE TABLE applications(id SERIAL PRIMARY KEY,user_id BIGINT,guild_id BIGINT,content TEXT,status TEXT DEFAULT 'pending',ts TEXT,message_id BIGINT)",
+            "CREATE TABLE invites(id SERIAL PRIMARY KEY,inviter_id BIGINT,invitee_id BIGINT,guild_id BIGINT,code TEXT,ts TEXT)",
+            "CREATE TABLE roblox_verify(user_id BIGINT PRIMARY KEY,roblox_id BIGINT,roblox_username TEXT,verified_ts TEXT)",
+            "CREATE TABLE tickets(id SERIAL PRIMARY KEY,guild_id BIGINT,channel_id BIGINT UNIQUE,user_id BIGINT,claimer_id BIGINT,status TEXT DEFAULT 'open',created_ts TEXT)",
+            "CREATE TABLE activity_checks(id SERIAL PRIMARY KEY,guild_id BIGINT,message_id BIGINT,channel_id BIGINT,ts TEXT)",
+            "CREATE TABLE event_logs(id SERIAL PRIMARY KEY,event_type TEXT,name TEXT,game_name TEXT,host_id BIGINT,guild_id BIGINT,channel_id BIGINT,message_id BIGINT,start_ts TEXT,end_ts TEXT,attendees TEXT,no_shows TEXT)",
+        ]
+        for sql in pg_tables:
+            c.execute(sql)
+    else:
+        sqlite_tables = [
+            "CREATE TABLE IF NOT EXISTS levels(user_id INT,guild_id INT,xp INT,level INT,PRIMARY KEY(user_id,guild_id))",
+            "CREATE TABLE IF NOT EXISTS tags(name TEXT,guild_id INT,content TEXT,author_id INT,uses INT DEFAULT 0,created TEXT)",
+            "CREATE TABLE IF NOT EXISTS warns(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,reason TEXT,mod_id INT,ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS strikes(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,reason TEXT,ts TEXT,mod_id INT,log_channel_id INT,log_message_id INT)",
+            "CREATE TABLE IF NOT EXISTS tempbans(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,expiry_timestamp TEXT)",
+            "CREATE TABLE IF NOT EXISTS applications(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,content TEXT,status TEXT DEFAULT 'pending',ts TEXT,message_id INT)",
+            "CREATE TABLE IF NOT EXISTS invites(id INTEGER PRIMARY KEY,inviter_id INT,invitee_id INT,guild_id INT,code TEXT,ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS roblox_verify(user_id INT PRIMARY KEY,roblox_id INT,roblox_username TEXT,verified_ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS tickets(id INTEGER PRIMARY KEY,guild_id INT,channel_id INT UNIQUE,user_id INT,claimer_id INT,status TEXT DEFAULT 'open',created_ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS activity_checks(id INTEGER PRIMARY KEY,guild_id INT,message_id INT,channel_id INT,ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS event_logs(id INTEGER PRIMARY KEY,event_type TEXT,name TEXT,game_name TEXT,host_id INT,guild_id INT,channel_id INT,message_id INT,start_ts TEXT,end_ts TEXT,attendees TEXT,no_shows TEXT)",
+        ]
+        for t in sqlite_tables:
+            c.execute(t)
         for col in ("log_channel_id", "log_message_id"):
             try: c.execute(f"ALTER TABLE strikes ADD COLUMN {col} INTEGER")
             except sqlite3.OperationalError: pass
