@@ -184,6 +184,7 @@ def require_role(role_name):
 
 app_sessions = {}  # {user_id: guild_id}
 invites_cache = {}  # {guild_id: {code: uses}}
+SLUR_PATTERNS = ["nigger", "nigga", "faggot", "chink", "kike", "spic", "wetback", "coon", "gook", "raghead", "sandnigger", "tranny"]
 active_events = {}  # {message_id: {type, name, game, host_id, guild_id, reactors:set(), channel_id, num}}
 # Helper to find active event by guild+number
 def _find_event_by_num(guild_id, num):
@@ -194,6 +195,10 @@ def _find_event_by_num(guild_id, num):
 
 ticket_warned = {}  # {channel_id: warned_timestamp}
 lockdown_state = {}  # {guild_id: {channel_id: discord.PermissionOverwrite or None}}
+
+def contains_slur(text):
+    t = text.lower()
+    return any(slur in t for slur in SLUR_PATTERNS)
 
 def get_log_channel(guild, name): return discord.utils.get(guild.text_channels, name=name)
 
@@ -320,6 +325,26 @@ async def on_ready():
 @bot.event
 async def on_member_join(member):
     guild = member.guild
+    # Auto-role
+    auto_role = get_role_by_name(guild, "OUTSIDER & UNRANKED")
+    if auto_role:
+        try:
+            await member.add_roles(auto_role)
+        except Exception:
+            pass
+    # Nickname slur filter
+    if member.nick and contains_slur(member.nick):
+        try:
+            await member.edit(nick="Moderated Nickname")
+        except Exception:
+            pass
+    # Welcome message
+    welcome_ch = discord.utils.get(guild.text_channels, name="『👋🏽』welcome-and-fairwell")
+    if welcome_ch:
+        e = discord.Embed(title="Welcome!", description=f"{member.mention} has joined the server.", color=discord.Color.green())
+        e.set_thumbnail(url=member.display_avatar.url)
+        e.set_footer(text=f"Member count: {guild.member_count}")
+        await welcome_ch.send(embed=e)
     try:
         invs = await guild.invites()
         old = invites_cache.get(guild.id, {})
@@ -336,7 +361,23 @@ async def on_member_join(member):
         pass
 
 @bot.event
+async def on_member_remove(member):
+    guild = member.guild
+    welcome_ch = discord.utils.get(guild.text_channels, name="『👋🏽』welcome-and-fairwell")
+    if welcome_ch:
+        e = discord.Embed(title="Goodbye", description=f"{member.mention} ({member.name}) has left the server.", color=discord.Color.red())
+        e.set_thumbnail(url=member.display_avatar.url)
+        e.set_footer(text=f"Member count: {guild.member_count}")
+        await welcome_ch.send(embed=e)
+
+@bot.event
 async def on_member_update(before, after):
+    # Nickname slur filter
+    if before.nick != after.nick and after.nick and contains_slur(after.nick):
+        try:
+            await after.edit(nick="Moderated Nickname")
+        except Exception:
+            pass
     if before.roles == after.roles:
         return
     got_staff = any(r.name == "STAFF" for r in after.roles) and not any(r.name == "STAFF" for r in before.roles)
@@ -397,6 +438,32 @@ async def on_raw_reaction_add(payload):
         return
     if payload.message_id in active_events:
         active_events[payload.message_id]["reactors"].add(payload.user_id)
+
+@bot.event
+async def on_message_delete(message):
+    if message.author.bot or not message.guild:
+        return
+    log_ch = get_log_channel(message.guild, "message-logs")
+    if log_ch:
+        e = discord.Embed(title="Message Deleted", color=discord.Color.red())
+        e.add_field(name="Author", value=message.author.mention, inline=False)
+        e.add_field(name="Channel", value=message.channel.mention, inline=False)
+        e.add_field(name="Content", value=message.content[:1024] or "(empty/attachment)", inline=False)
+        await log_ch.send(embed=e)
+
+@bot.event
+async def on_message_edit(before, after):
+    if before.author.bot or not before.guild or before.content == after.content:
+        return
+    log_ch = get_log_channel(before.guild, "message-logs")
+    if log_ch:
+        e = discord.Embed(title="Message Edited", color=discord.Color.orange())
+        e.add_field(name="Author", value=before.author.mention, inline=False)
+        e.add_field(name="Channel", value=before.channel.mention, inline=False)
+        e.add_field(name="Before", value=before.content[:1024] or "(empty)", inline=False)
+        e.add_field(name="After", value=after.content[:1024] or "(empty)", inline=False)
+        e.add_field(name="Jump", value=f"[Jump to message]({after.jump_url})", inline=False)
+        await log_ch.send(embed=e)
 
 @bot.event
 async def on_message(msg):
@@ -1562,7 +1629,8 @@ async def help(ctx):
     e = discord.Embed(title="Command List", color=discord.Color.blurple())
     e.add_field(name="Moderation", value="**Capo**: unban\n**Senior Lieutenant+**: ban, tempban\n**Lieutenant+**: addrole, removerole\n**Head Admin+**: kick, nick\n**Admin+**: purge, slowmode, lock, unlock, lockdown, unlockdown\n**Moderator+**: mute, unmute\n**STAFF+**: warn, warnlist, unwarn, clearwarnings, strike, removestrike (warns auto-decay after 14 days)", inline=False)
     e.add_field(name="Fun", value="8ball, coinflip, roll, rps, choose, rate, reverse, mock, cat, dog, meme", inline=False)
-    e.add_field(name="Utility", value="avatar, userinfo, serverinfo, roleinfo, channelinfo, emojiinfo, ping, invite, say, embed, poll, remind, timer", inline=False)
+    e.add_field(name="Utility", value="avatar, userinfo, serverinfo, roleinfo, channelinfo, emojiinfo, ping, invite, say, embed, poll, remind, timer, inviteleaderboard", inline=False)
+    e.add_field(name="Auto Features", value="Auto-role: OUTSIDER & UNRANKED | Welcome/Leave: 『👋🏽』welcome-and-fairwell | Message Logging: #message-logs | Warn Decay: 14 days", inline=False)
     e.add_field(name="Tags", value="tag, tagcreate, tagedit, tagdelete, taglist, taginfo", inline=False)
     e.add_field(name="Invites", value="invites, inviteleaderboard", inline=False)
     e.add_field(name="Applications", value="apply, accept, deny", inline=False)
