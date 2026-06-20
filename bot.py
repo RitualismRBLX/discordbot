@@ -44,11 +44,24 @@ class UnifiedCursor:
         if self._is_pg:
             operation = operation.replace("?", "%s")
             op_upper = operation.strip().upper()
+            # Tables that have no auto-increment 'id' column (app provides the PK)
+            no_id_tables = {"levels", "tags", "roblox_verify"}
             if op_upper.startswith("INSERT") and "RETURNING" not in op_upper:
-                operation = operation.rstrip(";") + " RETURNING id"
-                self._c.execute(operation, parameters)
-                row = self._c.fetchone()
-                self._lastrowid = row["id"] if row else None
+                # Extract table name from INSERT INTO tablename ...
+                parts = operation.strip().split()
+                tbl = ""
+                for i, p in enumerate(parts):
+                    if p.upper() == "INTO" and i + 1 < len(parts):
+                        tbl = parts[i + 1].strip('"').lower()
+                        break
+                if tbl not in no_id_tables:
+                    operation = operation.rstrip(";") + " RETURNING id"
+                    self._c.execute(operation, parameters)
+                    row = self._c.fetchone()
+                    self._lastrowid = row["id"] if row else None
+                else:
+                    self._c.execute(operation, parameters)
+                    self._lastrowid = None
             else:
                 self._c.execute(operation, parameters)
                 self._lastrowid = None
@@ -97,9 +110,7 @@ def db():
 def pg_schema(sql_str):
     if not IS_PG:
         return sql_str
-    return (sql_str
-        .replace("INTEGER PRIMARY KEY", "SERIAL PRIMARY KEY")
-        .replace("INT PRIMARY KEY", "SERIAL PRIMARY KEY"))
+    return sql_str.replace("INTEGER PRIMARY KEY", "SERIAL PRIMARY KEY")
 
 def init_db():
     conn = db()
