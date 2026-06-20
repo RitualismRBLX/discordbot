@@ -137,7 +137,6 @@ def init_db():
             "CREATE TABLE tickets(id SERIAL PRIMARY KEY,guild_id BIGINT,channel_id BIGINT UNIQUE,user_id BIGINT,claimer_id BIGINT,status TEXT DEFAULT 'open',created_ts TEXT)",
             "CREATE TABLE activity_checks(id SERIAL PRIMARY KEY,guild_id BIGINT,message_id BIGINT,channel_id BIGINT,ts TEXT)",
             "CREATE TABLE event_logs(id SERIAL PRIMARY KEY,num BIGINT,event_type TEXT,name TEXT,game_name TEXT,host_id BIGINT,guild_id BIGINT,channel_id BIGINT,message_id BIGINT,start_ts TEXT,end_ts TEXT,attendees TEXT,no_shows TEXT)",
-            "CREATE TABLE event_counters(guild_id BIGINT PRIMARY KEY,next_num BIGINT DEFAULT 1)",
         ]
         for sql in pg_tables:
             c.execute(sql)
@@ -154,7 +153,6 @@ def init_db():
             "CREATE TABLE IF NOT EXISTS tickets(id INTEGER PRIMARY KEY,guild_id INT,channel_id INT UNIQUE,user_id INT,claimer_id INT,status TEXT DEFAULT 'open',created_ts TEXT)",
             "CREATE TABLE IF NOT EXISTS activity_checks(id INTEGER PRIMARY KEY,guild_id INT,message_id INT,channel_id INT,ts TEXT)",
             "CREATE TABLE IF NOT EXISTS event_logs(id INTEGER PRIMARY KEY,num INTEGER,event_type TEXT,name TEXT,game_name TEXT,host_id INT,guild_id INT,channel_id INT,message_id INT,start_ts TEXT,end_ts TEXT,attendees TEXT,no_shows TEXT)",
-            "CREATE TABLE IF NOT EXISTS event_counters(guild_id INTEGER PRIMARY KEY,next_num INTEGER DEFAULT 1)",
         ]
         for t in sqlite_tables:
             c.execute(t)
@@ -1197,16 +1195,11 @@ async def _post_announcement(ctx, event_type, name, game_name, time_str, target_
     dt, unix_ts = parse_event_time(time_str)
     if not dt:
         return await ctx.send("Invalid time format. Use relative like `15m`, `2h`, `1d` or absolute like `22:30` or `10:30 PM`.")
-    # Get next event number for this guild
+    # Get next event number for this guild from persisted event_logs
     conn = db(); c = conn.cursor()
-    c.execute("SELECT next_num FROM event_counters WHERE guild_id=?", (ctx.guild.id,))
-    num_row = c.fetchone()
-    if num_row:
-        num = num_row[0]
-        c.execute("UPDATE event_counters SET next_num=next_num+1 WHERE guild_id=?", (ctx.guild.id,))
-    else:
-        num = 1
-        c.execute("INSERT INTO event_counters(guild_id,next_num) VALUES (?,2)", (ctx.guild.id,))
+    c.execute("SELECT COALESCE(MAX(num),0) FROM event_logs WHERE guild_id=?", (ctx.guild.id,))
+    max_num = c.fetchone()[0]
+    num = max_num + 1
     conn.commit(); conn.close()
     roblox_id = row["roblox_id"]
     roblox_link = f"https://www.roblox.com/users/{roblox_id}/profile"
@@ -1236,12 +1229,13 @@ async def _post_announcement(ctx, event_type, name, game_name, time_str, target_
     await ctx.send(f"{event_type.upper()} #{num} posted in {ch.mention}.")
 
 async def _start_ping(ctx, event_type, number_str: str):
-    # Parse number like "#2" or "2"
-    num_str = number_str.lstrip("#").strip()
+    if not number_str.startswith("#"):
+        return await ctx.send(f"Number must start with #. Example: `%{event_type}start #2`")
+    num_str = number_str[1:].strip()
     try:
         num = int(num_str)
     except ValueError:
-        return await ctx.send(f"Invalid number. Use `#{event_type}start #2` or `#{event_type}start 2`.")
+        return await ctx.send(f"Invalid number. Use `%{event_type}start #2`.")
     msg_id, ev = _find_event_by_num(ctx.guild.id, num)
     if not ev:
         return await ctx.send(f"No active {event_type} #{num} found.")
@@ -1265,12 +1259,13 @@ async def _start_ping(ctx, event_type, number_str: str):
     await ctx.send(f"{event_type.upper()} #{num} start ping sent.")
 
 async def _end_event(ctx, event_type, number_str: str):
-    # Parse number like "#2" or "2"
-    num_str = number_str.lstrip("#").strip()
+    if not number_str.startswith("#"):
+        return await ctx.send(f"Number must start with #. Example: `%{event_type}end #2`")
+    num_str = number_str[1:].strip()
     try:
         num = int(num_str)
     except ValueError:
-        return await ctx.send(f"Invalid number. Use `%{event_type}end #2` or `%{event_type}end 2`.")
+        return await ctx.send(f"Invalid number. Use `%{event_type}end #2`.")
     msg_id, ev = _find_event_by_num(ctx.guild.id, num)
     if not ev:
         return await ctx.send(f"No active {event_type} #{num} found.")
