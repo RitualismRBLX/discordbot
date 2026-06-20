@@ -135,13 +135,19 @@ def init_db():
     for t in tables:
         c.execute(pg_schema(t))
     if IS_PG:
-        # Convert existing INT columns that store Discord IDs to BIGINT
+        # Force-fix roblox_verify (no critical data yet, just drop and recreate with BIGINT)
         try:
-            c.execute("SELECT table_name, column_name FROM information_schema.columns WHERE data_type = 'integer' AND column_name LIKE '%id'")
+            c.execute("DROP TABLE IF EXISTS roblox_verify")
+            c.execute("CREATE TABLE roblox_verify(user_id BIGINT PRIMARY KEY,roblox_id BIGINT,roblox_username TEXT,verified_ts TEXT)")
+        except Exception:
+            pass
+        # Fix other tables with USING clause
+        try:
+            c.execute("SELECT table_name, column_name FROM information_schema.columns WHERE table_schema='public' AND data_type='integer' AND column_name LIKE '%id'")
             rows_to_fix = list(c.fetchall())
             for row in rows_to_fix:
                 try:
-                    c.execute(f"ALTER TABLE \"{row['table_name']}\" ALTER COLUMN \"{row['column_name']}\" TYPE BIGINT")
+                    c.execute(f'ALTER TABLE "{row["table_name"]}" ALTER COLUMN "{row["column_name"]}" TYPE BIGINT USING "{row["column_name"]}"::bigint')
                 except Exception:
                     pass
         except Exception:
