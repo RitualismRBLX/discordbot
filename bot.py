@@ -1249,9 +1249,9 @@ async def _start_ping(ctx, event_type, number_str: str):
         link = f"https://www.roblox.com/users/{row['roblox_id']}/profile"
         pings = [f"<@{uid}>" for uid in ev["reactors"] if uid != ctx.author.id]
         if pings:
-            await ch.send(f"{' '.join(pings[:75])}\n**{ev['name']}** is starting now! Join the host: {link}")
+            await ch.send(f"{' '.join(pings[:75])}\nStarted {link}")
         else:
-            await ch.send(f"**{ev['name']}** is starting now! Join the host: {link}")
+            await ch.send(f"Started {link}")
     await ctx.send(f"{event_type.upper()} #{num} start ping sent.")
 
 async def _end_event(ctx, event_type, number_str: str):
