@@ -113,33 +113,27 @@ def init_db():
     conn = db()
     c = conn.cursor()
     if IS_PG:
-        # PostgreSQL: all Discord ID columns must be BIGINT. Drop and recreate cleanly.
+        # PostgreSQL: CREATE IF NOT EXISTS to preserve data on restarts
         pg_tables = [
-            "DROP TABLE IF EXISTS event_logs CASCADE",
-            "DROP TABLE IF EXISTS activity_checks CASCADE",
-            "DROP TABLE IF EXISTS tickets CASCADE",
-            "DROP TABLE IF EXISTS roblox_verify CASCADE",
-            "DROP TABLE IF EXISTS invites CASCADE",
-            "DROP TABLE IF EXISTS applications CASCADE",
-            "DROP TABLE IF EXISTS tempbans CASCADE",
-            "DROP TABLE IF EXISTS strikes CASCADE",
-            "DROP TABLE IF EXISTS warns CASCADE",
-            "DROP TABLE IF EXISTS tags CASCADE",
-            "DROP TABLE IF EXISTS levels CASCADE",
-            "CREATE TABLE levels(user_id BIGINT,guild_id BIGINT,xp BIGINT,level BIGINT,PRIMARY KEY(user_id,guild_id))",
-            "CREATE TABLE tags(name TEXT,guild_id BIGINT,content TEXT,author_id BIGINT,uses BIGINT DEFAULT 0,created TEXT)",
-            "CREATE TABLE warns(id SERIAL PRIMARY KEY,user_id BIGINT,guild_id BIGINT,reason TEXT,mod_id BIGINT,ts TEXT)",
-            "CREATE TABLE strikes(id SERIAL PRIMARY KEY,user_id BIGINT,guild_id BIGINT,reason TEXT,ts TEXT,mod_id BIGINT,log_channel_id BIGINT,log_message_id BIGINT)",
-            "CREATE TABLE tempbans(id SERIAL PRIMARY KEY,user_id BIGINT,guild_id BIGINT,expiry_timestamp TEXT)",
-            "CREATE TABLE applications(id SERIAL PRIMARY KEY,user_id BIGINT,guild_id BIGINT,content TEXT,status TEXT DEFAULT 'pending',ts TEXT,message_id BIGINT)",
-            "CREATE TABLE invites(id SERIAL PRIMARY KEY,inviter_id BIGINT,invitee_id BIGINT,guild_id BIGINT,code TEXT,ts TEXT)",
-            "CREATE TABLE roblox_verify(user_id BIGINT PRIMARY KEY,roblox_id BIGINT,roblox_username TEXT,verified_ts TEXT)",
-            "CREATE TABLE tickets(id SERIAL PRIMARY KEY,guild_id BIGINT,channel_id BIGINT UNIQUE,user_id BIGINT,claimer_id BIGINT,status TEXT DEFAULT 'open',created_ts TEXT)",
-            "CREATE TABLE activity_checks(id SERIAL PRIMARY KEY,guild_id BIGINT,message_id BIGINT,channel_id BIGINT,ts TEXT)",
-            "CREATE TABLE event_logs(id SERIAL PRIMARY KEY,num BIGINT,event_type TEXT,name TEXT,game_name TEXT,host_id BIGINT,guild_id BIGINT,channel_id BIGINT,message_id BIGINT,start_ts TEXT,end_ts TEXT,attendees TEXT,no_shows TEXT)",
+            "CREATE TABLE IF NOT EXISTS levels(user_id BIGINT,guild_id BIGINT,xp BIGINT,level BIGINT,PRIMARY KEY(user_id,guild_id))",
+            "CREATE TABLE IF NOT EXISTS tags(name TEXT,guild_id BIGINT,content TEXT,author_id BIGINT,uses BIGINT DEFAULT 0,created TEXT)",
+            "CREATE TABLE IF NOT EXISTS warns(id SERIAL PRIMARY KEY,user_id BIGINT,guild_id BIGINT,reason TEXT,mod_id BIGINT,ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS strikes(id SERIAL PRIMARY KEY,user_id BIGINT,guild_id BIGINT,reason TEXT,ts TEXT,mod_id BIGINT,log_channel_id BIGINT,log_message_id BIGINT)",
+            "CREATE TABLE IF NOT EXISTS tempbans(id SERIAL PRIMARY KEY,user_id BIGINT,guild_id BIGINT,expiry_timestamp TEXT)",
+            "CREATE TABLE IF NOT EXISTS applications(id SERIAL PRIMARY KEY,user_id BIGINT,guild_id BIGINT,content TEXT,status TEXT DEFAULT 'pending',ts TEXT,message_id BIGINT)",
+            "CREATE TABLE IF NOT EXISTS invites(id SERIAL PRIMARY KEY,inviter_id BIGINT,invitee_id BIGINT,guild_id BIGINT,code TEXT,ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS roblox_verify(user_id BIGINT PRIMARY KEY,roblox_id BIGINT,roblox_username TEXT,verified_ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS tickets(id SERIAL PRIMARY KEY,guild_id BIGINT,channel_id BIGINT UNIQUE,user_id BIGINT,claimer_id BIGINT,status TEXT DEFAULT 'open',created_ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS activity_checks(id SERIAL PRIMARY KEY,guild_id BIGINT,message_id BIGINT,channel_id BIGINT,ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS event_logs(id SERIAL PRIMARY KEY,num BIGINT,event_type TEXT,name TEXT,game_name TEXT,host_id BIGINT,guild_id BIGINT,channel_id BIGINT,message_id BIGINT,start_ts TEXT,end_ts TEXT,attendees TEXT,no_shows TEXT)",
         ]
         for sql in pg_tables:
             c.execute(sql)
+        # Add new columns safely if tables already exist
+        try:
+            c.execute("ALTER TABLE event_logs ADD COLUMN IF NOT EXISTS num BIGINT")
+        except Exception:
+            pass
     else:
         sqlite_tables = [
             "CREATE TABLE IF NOT EXISTS levels(user_id INT,guild_id INT,xp INT,level INT,PRIMARY KEY(user_id,guild_id))",
@@ -159,6 +153,8 @@ def init_db():
         for col in ("log_channel_id", "log_message_id"):
             try: c.execute(f"ALTER TABLE strikes ADD COLUMN {col} INTEGER")
             except sqlite3.OperationalError: pass
+        try: c.execute("ALTER TABLE event_logs ADD COLUMN num INTEGER")
+        except sqlite3.OperationalError: pass
     conn.commit()
     conn.close()
 
