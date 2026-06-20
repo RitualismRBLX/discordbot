@@ -860,122 +860,123 @@ async def inviteleaderboard(ctx):
 # ─── OWNER SERVER AUDIT ───
 @bot.command()
 async def ritual(ctx):
+    if not ctx.guild:
+        return await ctx.send("This command must be used in the server.")
     if ctx.author.id != ctx.guild.owner_id:
         return await ctx.send("This command is reserved for the server owner.")
     guild = ctx.guild
-    lines = []
-    lines.append("=" * 60)
-    lines.append("  CÁRTEL NUEVA ALIANZA — FULL SERVER INTELLIGENCE AUDIT")
-    lines.append("=" * 60)
-    lines.append("")
-    lines.append("[ GENERAL SERVER INFO ]")
-    lines.append(f"Name: {guild.name}")
-    lines.append(f"ID: {guild.id}")
-    lines.append(f"Owner: {guild.owner} ({guild.owner_id})")
-    lines.append(f"Verification Level: {str(guild.verification_level)}")
-    lines.append(f"Default Notifications: {str(guild.default_notifications)}")
-    lines.append(f"Content Filter: {str(guild.explicit_content_filter)}")
-    lines.append(f"AFK Timeout: {guild.afk_timeout} seconds")
-    lines.append(f"AFK Channel: {guild.afk_channel.name if guild.afk_channel else 'None'}")
-    lines.append(f"System Channel: {guild.system_channel.name if guild.system_channel else 'None'}")
-    lines.append(f"Rules Channel: {guild.rules_channel.name if guild.rules_channel else 'None'}")
-    lines.append(f"Created At: {guild.created_at.isoformat()}")
-    lines.append(f"Member Count: {guild.member_count}")
-    lines.append(f"Max Members: {guild.max_members}")
-    lines.append(f"Boost Level: {guild.premium_tier}")
-    lines.append(f"Boost Count: {guild.premium_subscription_count}")
-    lines.append("")
-    lines.append("[ ROLES ]")
-    lines.append(f"Total Roles: {len(guild.roles)}")
-    for role in sorted(guild.roles, key=lambda r: r.position, reverse=True):
-        perms = ", ".join([p[0] for p in role.permissions if p[1]]) or "None"
-        lines.append(f"  - {role.name} (pos={role.position}, color={role.color}, hoist={role.hoist}, mentionable={role.mentionable})")
-        lines.append(f"    Members: {len(role.members)} | Key Perms: {perms}")
-    lines.append("")
-    lines.append("[ CATEGORIES ]")
-    categories = [c for c in guild.channels if isinstance(c, discord.CategoryChannel)]
-    lines.append(f"Total Categories: {len(categories)}")
-    for cat in sorted(categories, key=lambda c: c.position):
-        lines.append(f"  - {cat.name} (pos={cat.position}, id={cat.id})")
-    lines.append("")
-    lines.append("[ CHANNELS ]")
-    all_ch = sorted(guild.channels, key=lambda c: (c.category.position if c.category else -1, c.position))
-    lines.append(f"Total Channels: {len(guild.channels)}")
-    for ch in all_ch:
-        cat_name = ch.category.name if ch.category else "None"
-        if isinstance(ch, discord.TextChannel):
-            lines.append(f"  [TEXT] #{ch.name} | Category: {cat_name} | pos={ch.position} | slowmode={ch.slowmode_delay}s | nsfw={ch.nsfw}")
-            lines.append(f"    Topic: {ch.topic or 'None'}")
-        elif isinstance(ch, discord.VoiceChannel):
-            lines.append(f"  [VOICE] {ch.name} | Category: {cat_name} | pos={ch.position} | user_limit={ch.user_limit} | bitrate={ch.bitrate}")
-        elif isinstance(ch, discord.ForumChannel):
-            lines.append(f"  [FORUM] {ch.name} | Category: {cat_name} | pos={ch.position}")
-        elif isinstance(ch, discord.StageChannel):
-            lines.append(f"  [STAGE] {ch.name} | Category: {cat_name} | pos={ch.position}")
-        elif isinstance(ch, discord.CategoryChannel):
-            continue
-        else:
-            lines.append(f"  [OTHER] {ch.name} | Category: {cat_name} | pos={ch.position} | type={type(ch).__name__}")
-        if ch.overwrites:
-            lines.append(f"    Permission Overwrites:")
-            for target, overwrite in ch.overwrites.items():
-                allowed = [k for k, v in overwrite if v is True]
-                denied = [k for k, v in overwrite if v is False]
-                if allowed or denied:
-                    lines.append(f"      {target.name}: allow={allowed or 'none'}, deny={denied or 'none'}")
-    lines.append("")
-    lines.append("[ CHANNEL PERMISSION SUMMARY ]")
-    for ch in sorted(guild.text_channels, key=lambda c: (c.category.position if c.category else -1, c.position)):
-        staff_read = []
-        staff_send = []
-        staff_manage = []
-        for target, overwrite in ch.overwrites.items():
-            if isinstance(target, discord.Role):
-                perms = overwrite.pair()
-                if overwrite.view_channel is True or (overwrite.view_channel is None and target.permissions.view_channel):
-                    staff_read.append(target.name)
-                if overwrite.send_messages is True or (overwrite.send_messages is None and target.permissions.send_messages):
-                    staff_send.append(target.name)
-                if overwrite.manage_messages is True:
-                    staff_manage.append(target.name)
-        lines.append(f"  #{ch.name}:")
-        lines.append(f"    Roles that can SEE: {', '.join(staff_read[:10]) or 'None'}")
-        lines.append(f"    Roles that can SEND: {', '.join(staff_send[:10]) or 'None'}")
-        if staff_manage:
-            lines.append(f"    Roles that can MANAGE: {', '.join(staff_manage[:10])}")
-    lines.append("")
-    lines.append("[ MEMBERS WITH STAFF ROLES ]")
-    staff_keywords = ["STAFF", "Moderator", "Admin", "Head Admin", "Lieutenant", "Senior Lieutenant", "Capo"]
-    seen_staff = set()
-    for member in guild.members:
-        for role in member.roles:
-            if any(kw.lower() in role.name.lower() for kw in staff_keywords):
-                if member.id not in seen_staff:
-                    seen_staff.add(member.id)
-                    highest = max(member.roles, key=lambda r: r.position)
-                    lines.append(f"  - {member} ({member.id}) | Highest Role: {highest.name}")
-    lines.append("")
-    lines.append("[ BOT PERMISSIONS IN SERVER ]")
-    bot_member = guild.me
-    bot_perms = bot_member.guild_permissions
-    granted = [p[0] for p in bot_perms if p[1]]
-    lines.append(f"  Granted: {', '.join(granted) or 'None'}")
-    lines.append("")
-    lines.append("[ SERVER FEATURES ]")
-    lines.append(f"  {', '.join(guild.features) or 'None'}")
-    lines.append("")
-    lines.append("=" * 60)
-    lines.append("  END OF AUDIT")
-    lines.append("=" * 60)
-    audit_text = "\n".join(lines)
-    buffer = io.BytesIO(audit_text.encode('utf-8'))
-    buffer.seek(0)
-    filename = f"ritual_audit_{guild.id}_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.txt"
     try:
+        lines = []
+        lines.append("=" * 60)
+        lines.append("  CÁRTEL NUEVA ALIANZA — FULL SERVER INTELLIGENCE AUDIT")
+        lines.append("=" * 60)
+        lines.append("")
+        lines.append("[ GENERAL SERVER INFO ]")
+        lines.append(f"Name: {guild.name}")
+        lines.append(f"ID: {guild.id}")
+        lines.append(f"Owner: {guild.owner} ({guild.owner_id})")
+        lines.append(f"Verification Level: {str(guild.verification_level)}")
+        lines.append(f"Default Notifications: {str(guild.default_notifications)}")
+        lines.append(f"Content Filter: {str(guild.explicit_content_filter)}")
+        lines.append(f"AFK Timeout: {guild.afk_timeout} seconds")
+        lines.append(f"AFK Channel: {guild.afk_channel.name if guild.afk_channel else 'None'}")
+        lines.append(f"System Channel: {guild.system_channel.name if guild.system_channel else 'None'}")
+        lines.append(f"Rules Channel: {guild.rules_channel.name if guild.rules_channel else 'None'}")
+        lines.append(f"Created At: {guild.created_at.isoformat()}")
+        lines.append(f"Member Count: {guild.member_count}")
+        lines.append(f"Max Members: {guild.max_members}")
+        lines.append(f"Boost Level: {guild.premium_tier}")
+        lines.append(f"Boost Count: {guild.premium_subscription_count}")
+        lines.append("")
+        lines.append("[ ROLES ]")
+        lines.append(f"Total Roles: {len(guild.roles)}")
+        for role in sorted(guild.roles, key=lambda r: r.position, reverse=True):
+            perms = ", ".join([p[0] for p in role.permissions if p[1]]) or "None"
+            lines.append(f"  - {role.name} (pos={role.position}, color={role.color}, hoist={role.hoist}, mentionable={role.mentionable})")
+            lines.append(f"    Members: {len(role.members)} | Key Perms: {perms}")
+        lines.append("")
+        lines.append("[ CATEGORIES ]")
+        categories = [c for c in guild.channels if isinstance(c, discord.CategoryChannel)]
+        lines.append(f"Total Categories: {len(categories)}")
+        for cat in sorted(categories, key=lambda c: c.position):
+            lines.append(f"  - {cat.name} (pos={cat.position}, id={cat.id})")
+        lines.append("")
+        lines.append("[ CHANNELS ]")
+        all_ch = sorted(guild.channels, key=lambda c: (c.category.position if c.category else -1, c.position))
+        lines.append(f"Total Channels: {len(guild.channels)}")
+        for ch in all_ch:
+            cat_name = ch.category.name if ch.category else "None"
+            if isinstance(ch, discord.TextChannel):
+                lines.append(f"  [TEXT] #{ch.name} | Category: {cat_name} | pos={ch.position} | slowmode={ch.slowmode_delay}s | nsfw={ch.nsfw}")
+                lines.append(f"    Topic: {ch.topic or 'None'}")
+            elif isinstance(ch, discord.VoiceChannel):
+                lines.append(f"  [VOICE] {ch.name} | Category: {cat_name} | pos={ch.position} | user_limit={ch.user_limit} | bitrate={ch.bitrate}")
+            elif isinstance(ch, discord.ForumChannel):
+                lines.append(f"  [FORUM] {ch.name} | Category: {cat_name} | pos={ch.position}")
+            elif isinstance(ch, discord.StageChannel):
+                lines.append(f"  [STAGE] {ch.name} | Category: {cat_name} | pos={ch.position}")
+            elif isinstance(ch, discord.CategoryChannel):
+                continue
+            else:
+                lines.append(f"  [OTHER] {ch.name} | Category: {cat_name} | pos={ch.position} | type={type(ch).__name__}")
+            if ch.overwrites:
+                lines.append(f"    Permission Overwrites:")
+                for target, overwrite in ch.overwrites.items():
+                    allowed = [k for k, v in overwrite if v is True]
+                    denied = [k for k, v in overwrite if v is False]
+                    if allowed or denied:
+                        lines.append(f"      {target.name}: allow={allowed or 'none'}, deny={denied or 'none'}")
+        lines.append("")
+        lines.append("[ CHANNEL PERMISSION SUMMARY ]")
+        for ch in sorted(guild.text_channels, key=lambda c: (c.category.position if c.category else -1, c.position)):
+            staff_read = []
+            staff_send = []
+            staff_manage = []
+            for target, overwrite in ch.overwrites.items():
+                if isinstance(target, discord.Role):
+                    if overwrite.view_channel is True or (overwrite.view_channel is None and target.permissions.view_channel):
+                        staff_read.append(target.name)
+                    if overwrite.send_messages is True or (overwrite.send_messages is None and target.permissions.send_messages):
+                        staff_send.append(target.name)
+                    if overwrite.manage_messages is True:
+                        staff_manage.append(target.name)
+            lines.append(f"  #{ch.name}:")
+            lines.append(f"    Roles that can SEE: {', '.join(staff_read[:10]) or 'None'}")
+            lines.append(f"    Roles that can SEND: {', '.join(staff_send[:10]) or 'None'}")
+            if staff_manage:
+                lines.append(f"    Roles that can MANAGE: {', '.join(staff_manage[:10])}")
+        lines.append("")
+        lines.append("[ MEMBERS WITH STAFF ROLES ]")
+        staff_keywords = ["STAFF", "Moderator", "Admin", "Head Admin", "Lieutenant", "Senior Lieutenant", "Capo"]
+        seen_staff = set()
+        for member in guild.members:
+            for role in member.roles:
+                if any(kw.lower() in role.name.lower() for kw in staff_keywords):
+                    if member.id not in seen_staff:
+                        seen_staff.add(member.id)
+                        highest = max(member.roles, key=lambda r: r.position)
+                        lines.append(f"  - {member} ({member.id}) | Highest Role: {highest.name}")
+        lines.append("")
+        lines.append("[ BOT PERMISSIONS IN SERVER ]")
+        bot_member = guild.me
+        bot_perms = bot_member.guild_permissions
+        granted = [p[0] for p in bot_perms if p[1]]
+        lines.append(f"  Granted: {', '.join(granted) or 'None'}")
+        lines.append("")
+        lines.append("[ SERVER FEATURES ]")
+        lines.append(f"  {', '.join(guild.features) or 'None'}")
+        lines.append("")
+        lines.append("=" * 60)
+        lines.append("  END OF AUDIT")
+        lines.append("=" * 60)
+        audit_text = "\n".join(lines)
+        buffer = io.BytesIO(audit_text.encode('utf-8'))
+        buffer.seek(0)
+        filename = f"ritual_audit_{guild.id}_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.txt"
         await ctx.author.send(file=discord.File(buffer, filename=filename))
         await ctx.send("Audit complete. Check your DMs for the full server intelligence report.", delete_after=10)
-    except Exception:
-        await ctx.send("I couldn't DM you the audit file. Make sure your DMs are open.")
+    except Exception as e:
+        await ctx.send(f"Audit failed: `{type(e).__name__}: {e}`")
 
 # ─── HELP ───
 @bot.command()
