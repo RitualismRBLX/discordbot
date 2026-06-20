@@ -136,7 +136,8 @@ def init_db():
             "CREATE TABLE roblox_verify(user_id BIGINT PRIMARY KEY,roblox_id BIGINT,roblox_username TEXT,verified_ts TEXT)",
             "CREATE TABLE tickets(id SERIAL PRIMARY KEY,guild_id BIGINT,channel_id BIGINT UNIQUE,user_id BIGINT,claimer_id BIGINT,status TEXT DEFAULT 'open',created_ts TEXT)",
             "CREATE TABLE activity_checks(id SERIAL PRIMARY KEY,guild_id BIGINT,message_id BIGINT,channel_id BIGINT,ts TEXT)",
-            "CREATE TABLE event_logs(id SERIAL PRIMARY KEY,event_type TEXT,name TEXT,game_name TEXT,host_id BIGINT,guild_id BIGINT,channel_id BIGINT,message_id BIGINT,start_ts TEXT,end_ts TEXT,attendees TEXT,no_shows TEXT)",
+            "CREATE TABLE event_logs(id SERIAL PRIMARY KEY,num BIGINT,event_type TEXT,name TEXT,game_name TEXT,host_id BIGINT,guild_id BIGINT,channel_id BIGINT,message_id BIGINT,start_ts TEXT,end_ts TEXT,attendees TEXT,no_shows TEXT)",
+            "CREATE TABLE event_counters(guild_id BIGINT PRIMARY KEY,next_num BIGINT DEFAULT 1)",
         ]
         for sql in pg_tables:
             c.execute(sql)
@@ -152,7 +153,8 @@ def init_db():
             "CREATE TABLE IF NOT EXISTS roblox_verify(user_id INT PRIMARY KEY,roblox_id INT,roblox_username TEXT,verified_ts TEXT)",
             "CREATE TABLE IF NOT EXISTS tickets(id INTEGER PRIMARY KEY,guild_id INT,channel_id INT UNIQUE,user_id INT,claimer_id INT,status TEXT DEFAULT 'open',created_ts TEXT)",
             "CREATE TABLE IF NOT EXISTS activity_checks(id INTEGER PRIMARY KEY,guild_id INT,message_id INT,channel_id INT,ts TEXT)",
-            "CREATE TABLE IF NOT EXISTS event_logs(id INTEGER PRIMARY KEY,event_type TEXT,name TEXT,game_name TEXT,host_id INT,guild_id INT,channel_id INT,message_id INT,start_ts TEXT,end_ts TEXT,attendees TEXT,no_shows TEXT)",
+            "CREATE TABLE IF NOT EXISTS event_logs(id INTEGER PRIMARY KEY,num INTEGER,event_type TEXT,name TEXT,game_name TEXT,host_id INT,guild_id INT,channel_id INT,message_id INT,start_ts TEXT,end_ts TEXT,attendees TEXT,no_shows TEXT)",
+            "CREATE TABLE IF NOT EXISTS event_counters(guild_id INTEGER PRIMARY KEY,next_num INTEGER DEFAULT 1)",
         ]
         for t in sqlite_tables:
             c.execute(t)
@@ -188,7 +190,13 @@ def require_role(role_name):
 
 app_sessions = {}  # {user_id: guild_id}
 invites_cache = {}  # {guild_id: {code: uses}}
-active_events = {}  # {message_id: {type, name, game, host_id, guild_id, reactors:set(), channel_id}}
+active_events = {}  # {message_id: {type, name, game, host_id, guild_id, reactors:set(), channel_id, num}}
+# Helper to find active event by guild+number
+def _find_event_by_num(guild_id, num):
+    for msg_id, ev in active_events.items():
+        if ev.get("guild_id") == guild_id and ev.get("num") == num:
+            return msg_id, ev
+    return None, None
 
 def get_log_channel(guild, name): return discord.utils.get(guild.text_channels, name=name)
 
@@ -1189,9 +1197,20 @@ async def _post_announcement(ctx, event_type, name, game_name, time_str, target_
     dt, unix_ts = parse_event_time(time_str)
     if not dt:
         return await ctx.send("Invalid time format. Use relative like `15m`, `2h`, `1d` or absolute like `22:30` or `10:30 PM`.")
+    # Get next event number for this guild
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT next_num FROM event_counters WHERE guild_id=?", (ctx.guild.id,))
+    num_row = c.fetchone()
+    if num_row:
+        num = num_row[0]
+        c.execute("UPDATE event_counters SET next_num=next_num+1 WHERE guild_id=?", (ctx.guild.id,))
+    else:
+        num = 1
+        c.execute("INSERT INTO event_counters(guild_id,next_num) VALUES (?,2)", (ctx.guild.id,))
+    conn.commit(); conn.close()
     roblox_id = row["roblox_id"]
     roblox_link = f"https://www.roblox.com/users/{roblox_id}/profile"
-    e = discord.Embed(title=f"{'EVENT' if event_type=='event' else event_type.upper()}: {name}", color=discord.Color.red())
+    e = discord.Embed(title=f"#{num} {'EVENT' if event_type=='event' else event_type.upper()}: {name}", color=discord.Color.red())
     e.add_field(name="Host", value=ctx.author.mention, inline=False)
     if game_name:
         e.add_field(name="Game", value=game_name, inline=False)
@@ -1211,18 +1230,23 @@ async def _post_announcement(ctx, event_type, name, game_name, time_str, target_
         "channel_id": ch.id,
         "start_ts": datetime.datetime.utcnow().isoformat(),
         "event_time": dt.isoformat(),
-        "unix_ts": unix_ts
+        "unix_ts": unix_ts,
+        "num": num
     }
-    await ctx.send(f"{event_type.upper()} posted in {ch.mention}.")
+    await ctx.send(f"{event_type.upper()} #{num} posted in {ch.mention}.")
 
-async def _start_ping(ctx, event_type):
-    ref = ctx.message.reference
-    if not ref:
-        return await ctx.send(f"Reply to the {event_type} announcement to start it.")
-    msg_id = ref.message_id
-    if msg_id not in active_events:
-        return await ctx.send("That doesn't appear to be an active announcement.")
-    ev = active_events[msg_id]
+async def _start_ping(ctx, event_type, number_str: str):
+    # Parse number like "#2" or "2"
+    num_str = number_str.lstrip("#").strip()
+    try:
+        num = int(num_str)
+    except ValueError:
+        return await ctx.send(f"Invalid number. Use `#{event_type}start #2` or `#{event_type}start 2`.")
+    msg_id, ev = _find_event_by_num(ctx.guild.id, num)
+    if not ev:
+        return await ctx.send(f"No active {event_type} #{num} found.")
+    if ev["type"] != event_type:
+        return await ctx.send(f"#{num} is a {ev['type']}, not a {event_type}.")
     if ev["host_id"] != ctx.author.id:
         return await ctx.send("Only the host can start this.")
     ch = bot.get_channel(ev["channel_id"])
@@ -1238,19 +1262,23 @@ async def _start_ping(ctx, event_type):
             await ch.send(f"{' '.join(pings[:75])}\n**{ev['name']}** is starting now! Join the host: {link}")
         else:
             await ch.send(f"**{ev['name']}** is starting now! Join the host: {link}")
-    await ctx.send(f"{event_type.upper()} start ping sent.")
+    await ctx.send(f"{event_type.upper()} #{num} start ping sent.")
 
-async def _end_event(ctx, event_type):
-    ref = ctx.message.reference
-    if not ref:
-        return await ctx.send(f"Reply to the {event_type} announcement to end it.")
-    msg_id = ref.message_id
-    if msg_id not in active_events:
-        return await ctx.send("That doesn't appear to be an active announcement.")
-    ev = active_events[msg_id]
+async def _end_event(ctx, event_type, number_str: str):
+    # Parse number like "#2" or "2"
+    num_str = number_str.lstrip("#").strip()
+    try:
+        num = int(num_str)
+    except ValueError:
+        return await ctx.send(f"Invalid number. Use `%{event_type}end #2` or `%{event_type}end 2`.")
+    msg_id, ev = _find_event_by_num(ctx.guild.id, num)
+    if not ev:
+        return await ctx.send(f"No active {event_type} #{num} found.")
+    if ev["type"] != event_type:
+        return await ctx.send(f"#{num} is a {ev['type']}, not a {event_type}.")
     if ev["host_id"] != ctx.author.id:
         return await ctx.send("Only the host can end this.")
-    await ctx.send("Who attended? Mention all attendees (e.g., @user1 @user2). You have 5 minutes.")
+    await ctx.send(f"Ending #{num}. Who attended? Mention all attendees (e.g., @user1 @user2). You have 5 minutes.")
     def check(m):
         return m.author == ctx.author and m.channel == ctx.channel
     try:
@@ -1288,7 +1316,7 @@ async def _end_event(ctx, event_type):
     log_ch = get_log_channel(ctx.guild, "deployment-event-logs")
     if log_ch:
         et_display = "Event" if event_type == "event" else event_type.capitalize()
-        title = f"{ev['name']} {et_display}"
+        title = f"#{num} {ev['name']} {et_display}"
         lines = [f"• **Attended:** {', '.join(f'<@{u}>' for u in attendees) or 'None'}"]
         if no_shows:
             lines.append(f"• **No-Shows (Striked):** {', '.join(f'<@{u}>' for u in no_shows)}")
@@ -1296,11 +1324,11 @@ async def _end_event(ctx, event_type):
         e.description = "\n".join(lines)
         await log_ch.send(embed=e)
     conn = db(); c = conn.cursor()
-    c.execute("INSERT INTO event_logs (event_type,name,game_name,host_id,guild_id,channel_id,message_id,start_ts,end_ts,attendees,no_shows) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-              (event_type, ev["name"], ev["game"], ev["host_id"], ev["guild_id"], ev["channel_id"], msg_id, ev["start_ts"], datetime.datetime.utcnow().isoformat(), ','.join(str(u) for u in attendees), ','.join(str(u) for u in no_shows)))
+    c.execute("INSERT INTO event_logs (num,event_type,name,game_name,host_id,guild_id,channel_id,message_id,start_ts,end_ts,attendees,no_shows) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+              (num, event_type, ev["name"], ev["game"], ev["host_id"], ev["guild_id"], ev["channel_id"], msg_id, ev["start_ts"], datetime.datetime.utcnow().isoformat(), ','.join(str(u) for u in attendees), ','.join(str(u) for u in no_shows)))
     conn.commit(); conn.close()
     del active_events[msg_id]
-    await ctx.send(f"{event_type.upper()} ended. {len(attendees)} attended. {len(no_shows)} no-shows striked.")
+    await ctx.send(f"{event_type.upper()} #{num} ended. {len(attendees)} attended. {len(no_shows)} no-shows striked.")
 
 @bot.command()
 @require_role("STAFF")
@@ -1309,13 +1337,13 @@ async def event(ctx, name: str, *, time_str: str):
 
 @bot.command()
 @require_role("STAFF")
-async def eventstart(ctx):
-    await _start_ping(ctx, "event")
+async def eventstart(ctx, number: str):
+    await _start_ping(ctx, "event", number)
 
 @bot.command()
 @require_role("STAFF")
-async def eventend(ctx):
-    await _end_event(ctx, "event")
+async def eventend(ctx, number: str):
+    await _end_event(ctx, "event", number)
 
 @bot.command()
 @require_role("STAFF")
@@ -1324,13 +1352,13 @@ async def deployment(ctx, game_name: str, *, time_str: str):
 
 @bot.command()
 @require_role("STAFF")
-async def deploymentstart(ctx):
-    await _start_ping(ctx, "deployment")
+async def deploymentstart(ctx, number: str):
+    await _start_ping(ctx, "deployment", number)
 
 @bot.command()
 @require_role("STAFF")
-async def deploymentend(ctx):
-    await _end_event(ctx, "deployment")
+async def deploymentend(ctx, number: str):
+    await _end_event(ctx, "deployment", number)
 
 @bot.command()
 @require_role("STAFF")
@@ -1339,13 +1367,13 @@ async def raid(ctx, game_name: str, *, time_str: str):
 
 @bot.command()
 @require_role("STAFF")
-async def raidstart(ctx):
-    await _start_ping(ctx, "raid")
+async def raidstart(ctx, number: str):
+    await _start_ping(ctx, "raid", number)
 
 @bot.command()
 @require_role("STAFF")
-async def raidend(ctx):
-    await _end_event(ctx, "raid")
+async def raidend(ctx, number: str):
+    await _end_event(ctx, "raid", number)
 
 # ─── HELP ───
 @bot.command()
@@ -1359,9 +1387,9 @@ async def help(ctx):
     e.add_field(name="Applications", value="apply, accept, deny", inline=False)
     e.add_field(name="Tickets", value="ticket, claim, rename", inline=False)
     e.add_field(name="War Ranks", value="warrank (Lieutenant+)", inline=False)
-    e.add_field(name="Events", value="event, eventstart, eventend (STAFF+)", inline=False)
-    e.add_field(name="Deployments", value="deployment, deploymentstart, deploymentend (STAFF+)", inline=False)
-    e.add_field(name="Raids", value="raid, raidstart, raidend (STAFF+)", inline=False)
+    e.add_field(name="Events", value="`%event <name> <time>` → `%eventstart #N` → `%eventend #N` (STAFF+)", inline=False)
+    e.add_field(name="Deployments", value="`%deployment <game> <time>` → `%deploymentstart #N` → `%deploymentend #N` (STAFF+)", inline=False)
+    e.add_field(name="Raids", value="`%raid <game> <time>` → `%raidstart #N` → `%raidend #N` (STAFF+)", inline=False)
     e.add_field(name="Roblox", value="verifyroblox", inline=False)
     await ctx.send(embed=e)
 
