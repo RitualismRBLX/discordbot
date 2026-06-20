@@ -1370,6 +1370,46 @@ async def raidstart(ctx, number: str):
 async def raidend(ctx, number: str):
     await _end_event(ctx, "raid", number)
 
+async def _cancel_event(ctx, event_type, number_str: str, reason: str):
+    if not number_str.startswith("#"):
+        return await ctx.send(f"Number must start with #. Example: `%{event_type}cancel #2 <reason>`")
+    num_str = number_str[1:].strip()
+    try:
+        num = int(num_str)
+    except ValueError:
+        return await ctx.send(f"Invalid number. Use `%{event_type}cancel #2 <reason>`.")
+    msg_id, ev = _find_event_by_num(ctx.guild.id, num)
+    if not ev:
+        return await ctx.send(f"No active {event_type} #{num} found.")
+    if ev["type"] != event_type:
+        return await ctx.send(f"#{num} is a {ev['type']}, not a {event_type}.")
+    if ev["host_id"] != ctx.author.id:
+        return await ctx.send("Only the host can cancel this.")
+    ch = bot.get_channel(ev["channel_id"])
+    if ch:
+        await ch.send(f"**{ev['name']}** ({event_type.upper()} #{num}) has been **cancelled** by {ctx.author.mention}. Reason: `{reason}`")
+    log_ch = get_log_channel(ctx.guild, "deployment-event-logs")
+    if log_ch:
+        ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        await log_ch.send(f"[{ts}] action; {event_type}cancel | #{num} {ev['name']} | host; <@{ev['host_id']}> | reason; {reason}")
+    del active_events[msg_id]
+    await ctx.send(f"{event_type.upper()} #{num} cancelled. Reason: `{reason}`")
+
+@bot.command()
+@require_role("STAFF")
+async def eventcancel(ctx, number: str, *, reason: str):
+    await _cancel_event(ctx, "event", number, reason)
+
+@bot.command()
+@require_role("STAFF")
+async def deploymentcancel(ctx, number: str, *, reason: str):
+    await _cancel_event(ctx, "deployment", number, reason)
+
+@bot.command()
+@require_role("STAFF")
+async def raidcancel(ctx, number: str, *, reason: str):
+    await _cancel_event(ctx, "raid", number, reason)
+
 # ─── HELP ───
 @bot.command()
 async def help(ctx):
@@ -1382,9 +1422,9 @@ async def help(ctx):
     e.add_field(name="Applications", value="apply, accept, deny", inline=False)
     e.add_field(name="Tickets", value="ticket, claim, rename", inline=False)
     e.add_field(name="War Ranks", value="warrank (Lieutenant+)", inline=False)
-    e.add_field(name="Events", value="`%event <name> <time>` → `%eventstart #N` → `%eventend #N` (STAFF+)", inline=False)
-    e.add_field(name="Deployments", value="`%deployment <game> <time>` → `%deploymentstart #N` → `%deploymentend #N` (STAFF+)", inline=False)
-    e.add_field(name="Raids", value="`%raid <game> <time>` → `%raidstart #N` → `%raidend #N` (STAFF+)", inline=False)
+    e.add_field(name="Events", value="`%event <name> <time>` → `%eventstart #N` → `%eventend #N` / `%eventcancel #N <reason>` (STAFF+)", inline=False)
+    e.add_field(name="Deployments", value="`%deployment <game> <time>` → `%deploymentstart #N` → `%deploymentend #N` / `%deploymentcancel #N <reason>` (STAFF+)", inline=False)
+    e.add_field(name="Raids", value="`%raid <game> <time>` → `%raidstart #N` → `%raidend #N` / `%raidcancel #N <reason>` (STAFF+)", inline=False)
     e.add_field(name="Roblox", value="verifyroblox", inline=False)
     await ctx.send(embed=e)
 
