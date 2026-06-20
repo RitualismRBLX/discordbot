@@ -1002,6 +1002,9 @@ async def on_command_error(ctx, error):
         await ctx.send(f"Missing argument: `{error.param.name}`")
     elif isinstance(error, commands.BadArgument):
         await ctx.send("Invalid argument provided.")
+    elif isinstance(error, commands.CommandInvokeError):
+        original = error.original
+        await ctx.send(f"Command crashed: `{type(original).__name__}: {original}`")
     else:
         print(f"Error: {error}")
 
