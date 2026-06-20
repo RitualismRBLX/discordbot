@@ -904,20 +904,6 @@ async def nick(ctx, member: discord.Member, *, name):
     await member.edit(nick=name)
     await ctx.send(f"Changed {member.mention} nickname to `{name}`")
 
-@bot.command()
-@commands.has_permissions(manage_roles=True)
-@require_role("Lieutenant")
-async def addrole(ctx, member: discord.Member, *, role: discord.Role):
-    await member.add_roles(role)
-    await ctx.send(f"Added {role.mention} to {member.mention}")
-
-@bot.command()
-@commands.has_permissions(manage_roles=True)
-@require_role("Lieutenant")
-async def removerole(ctx, member: discord.Member, *, role: discord.Role):
-    await member.remove_roles(role)
-    await ctx.send(f"Removed {role.mention} from {member.mention}")
-
 @bot.command(aliases=["mwarn"])
 @commands.has_permissions(manage_messages=True)
 @require_role("STAFF")
