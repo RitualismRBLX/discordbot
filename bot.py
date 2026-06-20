@@ -2322,65 +2322,53 @@ async def review(ctx, app_id: int):
     if row["status"] != "pending":
         conn.close()
         return await ctx.send(f"This application is already **{row['status']}**.")
-    c.execute("SELECT voter_id, vote FROM app_votes WHERE app_id=?", (app_id,))
-    votes = c.fetchall(); conn.close()
-    yes = sum(1 for v in votes if v["vote"] == "yes")
-    no = sum(1 for v in votes if v["vote"] == "no")
+    conn.close()
     e = discord.Embed(title=f"Application #{app_id}", color=discord.Color.blurple())
     u = ctx.guild.get_member(row["user_id"])
     e.set_author(name=u.name if u else f"User {row['user_id']}", icon_url=u.display_avatar.url if u else None)
     e.description = row["content"][:4000] if row["content"] else "(no content)"
-    e.add_field(name="Votes", value=f"✅ {yes} | ❌ {no}", inline=False)
-    e.set_footer(text="React with ✅ to approve or ❌ to deny. Capo+ can also use %accept #<id> or %deny #<id>.")
-    msg = await ctx.send(embed=e)
-    await msg.add_reaction("✅")
-    await msg.add_reaction("❌")
+    e.set_footer(text="Capo+ can use %accept @user or %deny @user.")
+    await ctx.send(embed=e)
 
 @bot.command()
 @require_role("Capo")
-async def accept(ctx, app_id: int):
+async def accept(ctx, member: discord.Member):
     conn = db(); c = conn.cursor()
-    c.execute("SELECT user_id, content, status FROM applications WHERE id=? AND guild_id=?", (app_id, ctx.guild.id))
+    c.execute("SELECT id, status FROM applications WHERE user_id=? AND guild_id=? AND status='pending'", (member.id, ctx.guild.id))
     row = c.fetchone()
     if not row:
         conn.close()
-        return await ctx.send("Application not found.")
-    if row["status"] != "pending":
-        conn.close()
-        return await ctx.send(f"This application is already **{row['status']}**.")
+        return await ctx.send(f"No pending application found for {member.mention}.")
+    app_id = row["id"]
     c.execute("UPDATE applications SET status='accepted' WHERE id=?", (app_id,))
     conn.commit(); conn.close()
-    target = ctx.guild.get_member(row["user_id"])
-    if target:
-        member_role = discord.utils.get(ctx.guild.roles, name="Member")
-        outsider_role = discord.utils.get(ctx.guild.roles, name="OUTSIDER & UNRANKED")
-        if member_role:
-            try: await target.add_roles(member_role)
-            except Exception: pass
-        if outsider_role:
-            try: await target.remove_roles(outsider_role)
-            except Exception: pass
-        general = discord.utils.get(ctx.guild.text_channels, name="『💬』general-chat")
-        if general:
-            await general.send(f"Welcome {target.mention} enjoy your stay")
-    await ctx.send(f"Application **#{app_id}** has been **accepted**.")
-    await _log_punishment(ctx.guild, "application-accept", target or row["user_id"], ctx.author, f"Application #{app_id} accepted")
+    member_role = discord.utils.get(ctx.guild.roles, name="Member")
+    outsider_role = discord.utils.get(ctx.guild.roles, name="OUTSIDER & UNRANKED")
+    if member_role:
+        try: await member.add_roles(member_role)
+        except Exception: pass
+    if outsider_role:
+        try: await member.remove_roles(outsider_role)
+        except Exception: pass
+    general = discord.utils.get(ctx.guild.text_channels, name="『💬』general-chat")
+    if general:
+        await general.send(f"Welcome {member.mention} enjoy your stay")
+    await ctx.send(f"{member.mention}'s application has been **accepted**.")
+    await _log_punishment(ctx.guild, "application-accept", member, ctx.author, f"Application #{app_id} accepted")
 
 @bot.command()
 @require_role("Capo")
-async def deny(ctx, app_id: int):
+async def deny(ctx, member: discord.Member):
     conn = db(); c = conn.cursor()
-    c.execute("SELECT user_id, status FROM applications WHERE id=? AND guild_id=?", (app_id, ctx.guild.id))
+    c.execute("SELECT id, status FROM applications WHERE user_id=? AND guild_id=? AND status='pending'", (member.id, ctx.guild.id))
     row = c.fetchone()
     if not row:
         conn.close()
-        return await ctx.send("Application not found.")
-    if row["status"] != "pending":
-        conn.close()
-        return await ctx.send(f"This application is already **{row['status']}**.")
+        return await ctx.send(f"No pending application found for {member.mention}.")
+    app_id = row["id"]
     c.execute("UPDATE applications SET status='denied' WHERE id=?", (app_id,))
     conn.commit(); conn.close()
-    await ctx.send(f"Application **#{app_id}** has been **denied**.")
+    await ctx.send(f"{member.mention}'s application has been **denied**.")
 
 @bot.event
 async def on_raw_reaction_add(payload):
@@ -2403,68 +2391,6 @@ async def on_raw_reaction_add(payload):
             await member.move_to(vc)
         except Exception:
             pass
-        return
-    # Application votes
-    if str(payload.emoji) == "✅" and payload.guild_id:
-        guild = bot.get_guild(payload.guild_id)
-        if not guild:
-            return
-        member = guild.get_member(payload.user_id)
-        if not member or member.bot or not is_staff(member):
-            return
-        conn = db(); c = conn.cursor()
-        c.execute("SELECT id, user_id, status FROM applications WHERE message_id=? AND guild_id=?", (payload.message_id, payload.guild_id))
-        row = c.fetchone()
-        if row and row["status"] == "pending":
-            app_id = row["id"]
-            c.execute("SELECT 1 FROM app_votes WHERE app_id=? AND voter_id=?", (app_id, payload.user_id))
-            if not c.fetchone():
-                c.execute("INSERT INTO app_votes (app_id,voter_id,guild_id,vote,ts) VALUES (?,?,?,?,?)",
-                          (app_id, payload.user_id, payload.guild_id, "yes", datetime.datetime.utcnow().isoformat()))
-                conn.commit()
-                c.execute("SELECT COUNT(*) FROM app_votes WHERE app_id=? AND vote='yes'", (app_id,))
-                yes_count = c.fetchone()[0]
-                if yes_count >= 3:
-                    c.execute("UPDATE applications SET status='accepted' WHERE id=?", (app_id,))
-                    conn.commit()
-                    target = guild.get_member(row["user_id"])
-                    if target:
-                        member_role = discord.utils.get(guild.roles, name="Member")
-                        outsider_role = discord.utils.get(guild.roles, name="OUTSIDER & UNRANKED")
-                        if member_role:
-                            try: await target.add_roles(member_role)
-                            except Exception: pass
-                        if outsider_role:
-                            try: await target.remove_roles(outsider_role)
-                            except Exception: pass
-                        general = discord.utils.get(guild.text_channels, name="『💬』general-chat")
-                        if general:
-                            await general.send(f"Welcome {target.mention} enjoy your stay")
-        conn.close()
-        return
-    if str(payload.emoji) == "❌" and payload.guild_id:
-        guild = bot.get_guild(payload.guild_id)
-        if not guild:
-            return
-        member = guild.get_member(payload.user_id)
-        if not member or member.bot or not is_staff(member):
-            return
-        conn = db(); c = conn.cursor()
-        c.execute("SELECT id, user_id, status FROM applications WHERE message_id=? AND guild_id=?", (payload.message_id, payload.guild_id))
-        row = c.fetchone()
-        if row and row["status"] == "pending":
-            app_id = row["id"]
-            c.execute("SELECT 1 FROM app_votes WHERE app_id=? AND voter_id=?", (app_id, payload.user_id))
-            if not c.fetchone():
-                c.execute("INSERT INTO app_votes (app_id,voter_id,guild_id,vote,ts) VALUES (?,?,?,?,?)",
-                          (app_id, payload.user_id, payload.guild_id, "no", datetime.datetime.utcnow().isoformat()))
-                conn.commit()
-                c.execute("SELECT COUNT(*) FROM app_votes WHERE app_id=? AND vote='no'", (app_id,))
-                no_count = c.fetchone()[0]
-                if no_count >= 3:
-                    c.execute("UPDATE applications SET status='denied' WHERE id=?", (app_id,))
-                    conn.commit()
-        conn.close()
         return
     if str(payload.emoji) != "✅":
         return
