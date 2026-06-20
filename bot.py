@@ -30,6 +30,10 @@ def init_db():
     c.execute("CREATE TABLE IF NOT EXISTS tempbans(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,expiry_timestamp TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS applications(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,content TEXT,status TEXT DEFAULT 'pending',ts TEXT,message_id INT)")
     c.execute("CREATE TABLE IF NOT EXISTS invites(id INTEGER PRIMARY KEY,inviter_id INT,invitee_id INT,guild_id INT,code TEXT,ts TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS roblox_verify(user_id INT PRIMARY KEY,roblox_id INT,roblox_username TEXT,verified_ts TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS tickets(id INTEGER PRIMARY KEY,guild_id INT,channel_id INT UNIQUE,user_id INT,claimer_id INT,status TEXT DEFAULT 'open',created_ts TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS activity_checks(id INTEGER PRIMARY KEY,guild_id INT,message_id INT,channel_id INT,ts TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS event_logs(id INTEGER PRIMARY KEY,event_type TEXT,name TEXT,game_name TEXT,host_id INT,guild_id INT,channel_id INT,message_id INT,start_ts TEXT,end_ts TEXT,attendees TEXT,no_shows TEXT)")
     for col in ("log_channel_id", "log_message_id"):
         try: c.execute(f"ALTER TABLE strikes ADD COLUMN {col} INTEGER")
         except sqlite3.OperationalError: pass
@@ -62,6 +66,7 @@ def require_role(role_name):
 
 app_sessions = {}  # {user_id: guild_id}
 invites_cache = {}  # {guild_id: {code: uses}}
+active_events = {}  # {message_id: {type, name, game, host_id, guild_id, reactors:set(), channel_id}}
 
 def get_log_channel(guild, name): return discord.utils.get(guild.text_channels, name=name)
 
@@ -112,6 +117,7 @@ async def on_ready():
     await check_tempbans()
     for guild in bot.guilds:
         await cache_invites(guild)
+    bot.loop.create_task(daily_activity_check())
     print(f"Logged in as {bot.user} ({bot.user.id})")
 
 @bot.event
@@ -131,6 +137,69 @@ async def on_member_join(member):
         await cache_invites(guild)
     except Exception:
         pass
+
+@bot.event
+async def on_member_update(before, after):
+    if before.roles == after.roles:
+        return
+    got_staff = any(r.name == "STAFF" for r in after.roles) and not any(r.name == "STAFF" for r in before.roles)
+    if got_staff:
+        conn = db(); c = conn.cursor()
+        c.execute("SELECT roblox_id FROM roblox_verify WHERE user_id=?", (after.id,))
+        row = c.fetchone(); conn.close()
+        try:
+            if row and row["roblox_id"]:
+                await after.send(
+                    "**Welcome to the CNA Staff Team!**\n\n"
+                    "Your Roblox profile is already verified. You're all set to host events, deployments, and raids.\n\n"
+                    "Use `%help` to see all available commands."
+                )
+            else:
+                await after.send(
+                    "**Welcome to the CNA Staff Team!**\n\n"
+                    "You have been assigned the **STAFF** role. Before you can host events, deployments, or raids, "
+                    "you must verify your Roblox profile.\n\n"
+                    "**How to verify:**\n"
+                    "1. Find your Roblox User ID (go to your profile, the number in the URL).\n"
+                    "2. Run the command: `%verifyroblox <your_roblox_id>` in the server.\n\n"
+                    "Example: `%verifyroblox 609720362`\n\n"
+                    "Once verified, you'll be able to host events and your Roblox profile link will be shared with attendees."
+                )
+        except Exception:
+            pass
+
+async def daily_activity_check():
+    await bot.wait_until_ready()
+    while True:
+        now = datetime.datetime.utcnow()
+        # Noon CST = 18:00 UTC (CDT) or 17:00 UTC (CST). Using 18:00 UTC.
+        target = now.replace(hour=18, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += datetime.timedelta(days=1)
+        wait = (target - now).total_seconds()
+        await asyncio.sleep(wait)
+        for guild in bot.guilds:
+            ch = get_log_channel(guild, "activity-check")
+            if not ch:
+                continue
+            try:
+                e = discord.Embed(title="Daily Activity Check", description="React with ✅ to confirm you're active.", color=discord.Color.green())
+                e.set_footer(text=f"Posted at {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+                msg = await ch.send("@everyone", embed=e)
+                await msg.add_reaction("✅")
+                conn = db(); c = conn.cursor()
+                c.execute("INSERT INTO activity_checks (guild_id, message_id, channel_id, ts) VALUES (?,?,?,?)",
+                          (guild.id, msg.id, ch.id, datetime.datetime.utcnow().isoformat()))
+                conn.commit(); conn.close()
+            except Exception:
+                pass
+
+@bot.event
+async def on_raw_reaction_add(payload):
+    if str(payload.emoji) != "✅":
+        return
+    if payload.message_id in active_events:
+        active_events[payload.message_id]["reactors"].add(payload.user_id)
 
 @bot.event
 async def on_message(msg):
@@ -814,6 +883,266 @@ async def inviteleaderboard(ctx):
     e.description = "\n".join(lines)
     await ctx.send(embed=e)
 
+# ─── TICKETS ───
+@bot.command()
+async def ticket(ctx, *, reason="No reason provided"):
+    guild = ctx.guild
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        ctx.author: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+    }
+    for role in guild.roles:
+        if role.name == "STAFF":
+            overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
+    try:
+        ch = await guild.create_text_channel(f"ticket-{ctx.author.name}", overwrites=overwrites, reason=f"Ticket by {ctx.author}: {reason}")
+    except discord.Forbidden:
+        return await ctx.send("I don't have permission to create channels.")
+    conn = db(); c = conn.cursor()
+    c.execute("INSERT INTO tickets (guild_id, channel_id, user_id, created_ts) VALUES (?,?,?,?)",
+              (guild.id, ch.id, ctx.author.id, datetime.datetime.utcnow().isoformat()))
+    conn.commit(); conn.close()
+    await ch.send(f"{ctx.author.mention} Ticket created. Reason: `{reason}`\nStaff can use `%claim` to take ownership and `%rename <name>` to rename this channel.")
+    log_ch = get_log_channel(guild, "ticket-logs")
+    if log_ch:
+        await log_ch.send(f"Ticket created by {ctx.author.mention} in {ch.mention} | Reason: `{reason}`")
+    await ctx.send(f"Ticket created: {ch.mention}", delete_after=10)
+
+@bot.command()
+@require_role("STAFF")
+async def claim(ctx):
+    if not ctx.channel.name.startswith("ticket-"):
+        return await ctx.send("This command only works in ticket channels.")
+    conn = db(); c = conn.cursor()
+    c.execute("UPDATE tickets SET claimer_id=? WHERE channel_id=?", (ctx.author.id, ctx.channel.id))
+    conn.commit(); conn.close()
+    await ctx.send(f"Ticket claimed by {ctx.author.mention}.")
+
+@bot.command()
+@require_role("STAFF")
+async def rename(ctx, *, new_name):
+    if not ctx.channel.name.startswith("ticket-"):
+        return await ctx.send("This command only works in ticket channels.")
+    try:
+        await ctx.channel.edit(name=f"ticket-{new_name}")
+        await ctx.send(f"Renamed to `ticket-{new_name}`.")
+    except discord.Forbidden:
+        await ctx.send("Missing permissions to rename channel.")
+
+# ─── WAR RANKS ───
+@bot.command()
+@require_role("Lieutenant")
+async def warrank(ctx, member: discord.Member, *, rank: str):
+    rank = rank.lower().strip()
+    valid = {"fragger", "lead", "assembly", "subs", "sub", "raid"}
+    if rank not in valid and rank + "s" not in valid:
+        return await ctx.send("Invalid rank. Use: fragger, lead, assembly, subs, raid")
+    if rank == "sub": rank = "subs"
+    if rank == "subs": rank = "subs"
+    # Determine NM or CB
+    await ctx.send("Which faction? Reply `NM` (NoMercy) or `CB` (Chicblocko).")
+    def check(m):
+        return m.author == ctx.author and m.channel == ctx.channel and m.content.upper() in ("NM", "CB")
+    try:
+        msg = await bot.wait_for('message', check=check, timeout=30)
+    except asyncio.TimeoutError:
+        return await ctx.send("Timed out.")
+    faction = msg.content.upper()
+    role_map = {
+        "fragger": f"{faction} | War Fragger",
+        "lead": f"{faction} | War Lead",
+        "assembly": f"{faction} | War Assembly",
+        "subs": f"{faction} | WAR SUBS",
+        "raid": f"{faction} | RAID TEAM",
+    }
+    role_name = role_map.get(rank)
+    if not role_name:
+        return await ctx.send("Invalid rank mapping.")
+    role = get_role_by_name(ctx.guild, role_name)
+    if not role:
+        return await ctx.send(f"Role `{role_name}` not found.")
+    try:
+        await member.add_roles(role)
+        await ctx.send(f"Assigned **{role_name}** to {member.mention}.")
+    except discord.Forbidden:
+        await ctx.send("Missing permissions to assign role.")
+
+# ─── ROBLOX VERIFICATION ───
+@bot.command()
+async def verifyroblox(ctx, roblox_id: int):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT 1 FROM roblox_verify WHERE user_id=?", (ctx.author.id,))
+    if c.fetchone():
+        conn.close()
+        return await ctx.send("You are already verified. Contact staff if you need to update your profile.")
+    c.execute("INSERT INTO roblox_verify (user_id, roblox_id, verified_ts) VALUES (?,?,?)",
+              (ctx.author.id, roblox_id, datetime.datetime.utcnow().isoformat()))
+    conn.commit(); conn.close()
+    link = f"https://www.roblox.com/users/{roblox_id}/profile"
+    await ctx.send(f"Roblox profile verified: {link}")
+
+# ─── EVENTS / DEPLOYMENTS / RAIDS ───
+async def _post_announcement(ctx, event_type, name, game_name, time_str, target_channel_name):
+    ch = get_log_channel(ctx.guild, target_channel_name)
+    if not ch:
+        return await ctx.send(f"Channel #{target_channel_name} not found.")
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT roblox_id FROM roblox_verify WHERE user_id=?", (ctx.author.id,))
+    row = c.fetchone(); conn.close()
+    if not row or not row["roblox_id"]:
+        return await ctx.send("You must verify your Roblox profile first. Use `%verifyroblox <your_roblox_id>`.")
+    roblox_id = row["roblox_id"]
+    roblox_link = f"https://www.roblox.com/users/{roblox_id}/profile"
+    e = discord.Embed(title=f"{'EVENT' if event_type=='event' else event_type.upper()}: {name}", color=discord.Color.red())
+    e.add_field(name="Host", value=ctx.author.mention, inline=False)
+    if game_name:
+        e.add_field(name="Game", value=game_name, inline=False)
+    e.add_field(name="Time", value=time_str, inline=False)
+    e.add_field(name="RSVP", value="React with ✅ to confirm attendance.", inline=False)
+    e.set_footer(text=f"Host Roblox: {roblox_link}")
+    msg = await ch.send("@everyone", embed=e)
+    await msg.add_reaction("✅")
+    active_events[msg.id] = {
+        "type": event_type,
+        "name": name,
+        "game": game_name or "",
+        "host_id": ctx.author.id,
+        "guild_id": ctx.guild.id,
+        "reactors": set(),
+        "channel_id": ch.id,
+        "start_ts": datetime.datetime.utcnow().isoformat()
+    }
+    await ctx.send(f"{event_type.upper()} posted in {ch.mention}.")
+
+async def _start_ping(ctx, event_type):
+    ref = ctx.message.reference
+    if not ref:
+        return await ctx.send(f"Reply to the {event_type} announcement to start it.")
+    msg_id = ref.message_id
+    if msg_id not in active_events:
+        return await ctx.send("That doesn't appear to be an active announcement.")
+    ev = active_events[msg_id]
+    if ev["host_id"] != ctx.author.id:
+        return await ctx.send("Only the host can start this.")
+    ch = bot.get_channel(ev["channel_id"])
+    if not ch:
+        return await ctx.send("Announcement channel not found.")
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT roblox_id FROM roblox_verify WHERE user_id=?", (ev["host_id"],))
+    row = c.fetchone(); conn.close()
+    if row and row["roblox_id"]:
+        link = f"https://www.roblox.com/users/{row['roblox_id']}/profile"
+        pings = [f"<@{uid}>" for uid in ev["reactors"] if uid != ctx.author.id]
+        if pings:
+            await ch.send(f"{' '.join(pings[:75])}\n**{ev['name']}** is starting now! Join the host: {link}")
+        else:
+            await ch.send(f"**{ev['name']}** is starting now! Join the host: {link}")
+    await ctx.send(f"{event_type.upper()} start ping sent.")
+
+async def _end_event(ctx, event_type):
+    ref = ctx.message.reference
+    if not ref:
+        return await ctx.send(f"Reply to the {event_type} announcement to end it.")
+    msg_id = ref.message_id
+    if msg_id not in active_events:
+        return await ctx.send("That doesn't appear to be an active announcement.")
+    ev = active_events[msg_id]
+    if ev["host_id"] != ctx.author.id:
+        return await ctx.send("Only the host can end this.")
+    await ctx.send("Who attended? Mention all attendees (e.g., @user1 @user2). You have 5 minutes.")
+    def check(m):
+        return m.author == ctx.author and m.channel == ctx.channel
+    try:
+        msg = await bot.wait_for('message', check=check, timeout=300)
+    except asyncio.TimeoutError:
+        return await ctx.send("Timed out. Event not ended.")
+    attendees = set(m.id for m in msg.mentions)
+    reactors = ev["reactors"]
+    no_shows = reactors - attendees - {ctx.author.id}
+    for user_id in no_shows:
+        now = datetime.datetime.utcnow().isoformat()
+        conn = db(); c = conn.cursor()
+        c.execute("INSERT INTO strikes (user_id,guild_id,reason,ts,mod_id) VALUES (?,?,?,?,?)",
+                  (user_id, ctx.guild.id, f"Failure to attend a reacted {event_type}", now, ctx.author.id))
+        conn.commit(); sid = c.lastrowid
+        c.execute("SELECT COUNT(*) FROM strikes WHERE user_id=? AND guild_id=?", (user_id, ctx.guild.id))
+        count = c.fetchone()[0]
+        conn.close()
+        member = ctx.guild.get_member(user_id)
+        if member:
+            try:
+                await member.send(f"You were striked for failing to attend the **{ev['name']}** {event_type}. Strike {count}/3.")
+            except Exception:
+                pass
+        if count >= 3 and member:
+            expiry = (datetime.datetime.utcnow() + datetime.timedelta(days=7)).isoformat()
+            conn = db(); c = conn.cursor()
+            c.execute("INSERT INTO tempbans (user_id,guild_id,expiry_timestamp) VALUES (?,?,?)", (user_id, ctx.guild.id, expiry))
+            conn.commit(); conn.close()
+            try:
+                await member.ban(reason="3 strikes - 7 day tempban")
+                asyncio.create_task(_delayed_unban(ctx.guild, user_id, expiry, 7*24*60*60))
+            except Exception:
+                pass
+    log_ch = get_log_channel(ctx.guild, "deployment-event-logs")
+    if log_ch:
+        e = discord.Embed(title=f"{event_type.upper()} Ended: {ev['name']}", color=discord.Color.blue())
+        e.add_field(name="Host", value=f"<@{ev['host_id']}>", inline=False)
+        e.add_field(name="Attendees", value=', '.join(f"<@{u}>" for u in attendees) or "None", inline=False)
+        e.add_field(name="No-Shows (Striked)", value=', '.join(f"<@{u}>" for u in no_shows) or "None", inline=False)
+        await log_ch.send(embed=e)
+    conn = db(); c = conn.cursor()
+    c.execute("INSERT INTO event_logs (event_type,name,game_name,host_id,guild_id,channel_id,message_id,start_ts,end_ts,attendees,no_shows) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+              (event_type, ev["name"], ev["game"], ev["host_id"], ev["guild_id"], ev["channel_id"], msg_id, ev["start_ts"], datetime.datetime.utcnow().isoformat(), ','.join(str(u) for u in attendees), ','.join(str(u) for u in no_shows)))
+    conn.commit(); conn.close()
+    del active_events[msg_id]
+    await ctx.send(f"{event_type.upper()} ended. {len(attendees)} attended. {len(no_shows)} no-shows striked.")
+
+@bot.command()
+@require_role("STAFF")
+async def event(ctx, name: str, *, time_str: str):
+    await _post_announcement(ctx, "event", name, None, time_str, "『⚡』events")
+
+@bot.command()
+@require_role("STAFF")
+async def eventstart(ctx):
+    await _start_ping(ctx, "event")
+
+@bot.command()
+@require_role("STAFF")
+async def eventend(ctx):
+    await _end_event(ctx, "event")
+
+@bot.command()
+@require_role("STAFF")
+async def deployment(ctx, game_name: str, *, time_str: str):
+    await _post_announcement(ctx, "deployment", f"{game_name} Deployment", game_name, time_str, "『🎪』deployments-raids")
+
+@bot.command()
+@require_role("STAFF")
+async def deploymentstart(ctx):
+    await _start_ping(ctx, "deployment")
+
+@bot.command()
+@require_role("STAFF")
+async def deploymentend(ctx):
+    await _end_event(ctx, "deployment")
+
+@bot.command()
+@require_role("STAFF")
+async def raid(ctx, game_name: str, *, time_str: str):
+    await _post_announcement(ctx, "raid", f"{game_name} Raid", game_name, time_str, "『🎪』deployments-raids")
+
+@bot.command()
+@require_role("STAFF")
+async def raidstart(ctx):
+    await _start_ping(ctx, "raid")
+
+@bot.command()
+@require_role("STAFF")
+async def raidend(ctx):
+    await _end_event(ctx, "raid")
+
 # ─── HELP ───
 @bot.command()
 async def help(ctx):
@@ -824,6 +1153,12 @@ async def help(ctx):
     e.add_field(name="Tags", value="tag, tagcreate, tagedit, tagdelete, taglist, taginfo", inline=False)
     e.add_field(name="Invites", value="invites, inviteleaderboard", inline=False)
     e.add_field(name="Applications", value="apply, accept, deny", inline=False)
+    e.add_field(name="Tickets", value="ticket, claim, rename", inline=False)
+    e.add_field(name="War Ranks", value="warrank (Lieutenant+)", inline=False)
+    e.add_field(name="Events", value="event, eventstart, eventend (STAFF+)", inline=False)
+    e.add_field(name="Deployments", value="deployment, deploymentstart, deploymentend (STAFF+)", inline=False)
+    e.add_field(name="Raids", value="raid, raidstart, raidend (STAFF+)", inline=False)
+    e.add_field(name="Roblox", value="verifyroblox", inline=False)
     await ctx.send(embed=e)
 
 @bot.event
