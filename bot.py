@@ -2331,10 +2331,56 @@ async def review(ctx, app_id: int):
     e.set_author(name=u.name if u else f"User {row['user_id']}", icon_url=u.display_avatar.url if u else None)
     e.description = row["content"][:4000] if row["content"] else "(no content)"
     e.add_field(name="Votes", value=f"✅ {yes} | ❌ {no}", inline=False)
-    e.set_footer(text="React with ✅ to approve or ❌ to deny this application.")
+    e.set_footer(text="React with ✅ to approve or ❌ to deny. Capo+ can also use %accept #<id> or %deny #<id>.")
     msg = await ctx.send(embed=e)
     await msg.add_reaction("✅")
     await msg.add_reaction("❌")
+
+@bot.command()
+@require_role("Capo")
+async def accept(ctx, app_id: int):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT user_id, content, status FROM applications WHERE id=? AND guild_id=?", (app_id, ctx.guild.id))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return await ctx.send("Application not found.")
+    if row["status"] != "pending":
+        conn.close()
+        return await ctx.send(f"This application is already **{row['status']}**.")
+    c.execute("UPDATE applications SET status='accepted' WHERE id=?", (app_id,))
+    conn.commit(); conn.close()
+    target = ctx.guild.get_member(row["user_id"])
+    if target:
+        member_role = discord.utils.get(ctx.guild.roles, name="Member")
+        outsider_role = discord.utils.get(ctx.guild.roles, name="OUTSIDER & UNRANKED")
+        if member_role:
+            try: await target.add_roles(member_role)
+            except Exception: pass
+        if outsider_role:
+            try: await target.remove_roles(outsider_role)
+            except Exception: pass
+        general = discord.utils.get(ctx.guild.text_channels, name="『💬』general-chat")
+        if general:
+            await general.send(f"Welcome {target.mention} enjoy your stay")
+    await ctx.send(f"Application **#{app_id}** has been **accepted**.")
+    await _log_punishment(ctx.guild, "application-accept", target or row["user_id"], ctx.author, f"Application #{app_id} accepted")
+
+@bot.command()
+@require_role("Capo")
+async def deny(ctx, app_id: int):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT user_id, status FROM applications WHERE id=? AND guild_id=?", (app_id, ctx.guild.id))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return await ctx.send("Application not found.")
+    if row["status"] != "pending":
+        conn.close()
+        return await ctx.send(f"This application is already **{row['status']}**.")
+    c.execute("UPDATE applications SET status='denied' WHERE id=?", (app_id,))
+    conn.commit(); conn.close()
+    await ctx.send(f"Application **#{app_id}** has been **denied**.")
 
 @bot.event
 async def on_raw_reaction_add(payload):
