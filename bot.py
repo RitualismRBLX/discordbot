@@ -110,7 +110,11 @@ def db():
 def pg_schema(sql_str):
     if not IS_PG:
         return sql_str
-    return sql_str.replace("INTEGER PRIMARY KEY", "SERIAL PRIMARY KEY")
+    return (sql_str
+        .replace("INTEGER PRIMARY KEY", "SERIAL PRIMARY KEY")
+        .replace("INT PRIMARY KEY", "BIGINT PRIMARY KEY")
+        .replace(" INT ", " BIGINT ")
+        .replace(" INT)", " BIGINT)"))
 
 def init_db():
     conn = db()
@@ -130,6 +134,17 @@ def init_db():
     ]
     for t in tables:
         c.execute(pg_schema(t))
+    if IS_PG:
+        # Convert existing INT columns that store Discord IDs to BIGINT
+        try:
+            c.execute("SELECT table_name, column_name FROM information_schema.columns WHERE data_type = 'integer' AND column_name LIKE '%id'")
+            for row in c.fetchall():
+                try:
+                    c.execute(f"ALTER TABLE {row['table_name']} ALTER COLUMN {row['column_name']} TYPE BIGINT")
+                except Exception:
+                    pass
+        except Exception:
+            pass
     if not IS_PG:
         for col in ("log_channel_id", "log_message_id"):
             try: c.execute(f"ALTER TABLE strikes ADD COLUMN {col} INTEGER")
