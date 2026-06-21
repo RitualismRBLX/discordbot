@@ -2237,12 +2237,11 @@ async def _run_application(ctx, app_type, questions):
     e = discord.Embed(title=f"New {'Staff' if app_type == 'staff' else 'Member'} Application", color=discord.Color.green(), timestamp=datetime.datetime.utcnow())
     e.set_author(name=f"{ctx.author} ({ctx.author.id})", icon_url=ctx.author.display_avatar.url if ctx.author.display_avatar else None)
     e.description = formatted[:4000]
-    e.set_footer(text=f"Type: {app_type} | Use %review #N to vote")
+    e.set_footer(text=f"Type: {app_type} | Use %review #N to view | Capo+ can %accept/%deny @user")
     staff_role = discord.utils.get(ctx.guild.roles, name="STAFF")
     mention = staff_role.mention if staff_role else "@STAFF"
     try:
         app_msg = await pending_ch.send(f"{mention} New Application {ctx.author.mention}", embed=e)
-        await app_msg.add_reaction("✅")
     except Exception:
         await dm.send("Error submitting your application. Contact staff.")
         return
@@ -2271,14 +2270,18 @@ MEMBER_QUESTIONS = [
 ]
 
 STAFF_QUESTIONS = [
-    "Discord Username:",
-    "Roblox Username:",
-    "What position are you applying for? (Moderator / Admin / etc.):",
-    "How long have you been in the server?",
-    "What experience do you have with moderation or leadership?",
-    "Why do you want to join the staff team?",
-    "How would you handle a rule-breaking member?",
-    "What timezone are you in?"
+    "Discord Username & Tag (e.g., user#0000):",
+    "Roblox Username & Profile Link:",
+    "Current Discord Server Nickname:",
+    "How long have you been in Cártel Nueva Alianza and what is your current in-game rank/role?",
+    "What is your age? (You must be 14+ to apply for staff):",
+    "What previous moderation, leadership, or staffing experience do you have? Include server names, roles held, and duration.",
+    "Why do you want to join the CNA staff team specifically? What can you bring that other applicants cannot?",
+    "A member is spamming racial slurs in general chat and ignoring warnings. Another member is DMing server invites to everyone. Walk us through how you handle BOTH situations step-by-step.",
+    "You witness a Lieutenant+ abusing their power by unfairly kicking lower-ranked members. No other staff are online. What do you do?",
+    "How would you de-escalate a heated argument between two high-ranking members in a public channel without making either look bad?",
+    "What is your timezone and what hours are you typically active? Be specific with days AND times (e.g., EST Mon-Fri 4PM-10PM).",
+    "Do you understand that as Moderator you are the LOWEST staff rank, must follow all orders from Admin+, can be demoted for inactivity or abuse, and that applying for any rank higher than Moderator is an instant rejection? Type 'Yes, I understand.'"
 ]
 
 @bot.command()
