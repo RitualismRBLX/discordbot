@@ -1,6 +1,6 @@
 import discord
 from discord.ext import commands
-import os, sqlite3, datetime, asyncio, random, aiohttp, io
+import os, sqlite3, datetime, asyncio, random, aiohttp, io, re
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -242,7 +242,7 @@ pending_app_msgs = {}  # {app_id: message_id} cache for vote tracking
 
 def contains_slur(text):
     t = text.lower()
-    return any(slur in t for slur in SLUR_PATTERNS)
+    return any(re.search(rf'\\b{re.escape(slur)}\\b', t) for slur in SLUR_PATTERNS)
 
 def get_log_channel(guild, name): return discord.utils.get(guild.text_channels, name=name)
 
@@ -626,7 +626,7 @@ BLACKLIST_WORDS = set(SLUR_PATTERNS + CHEAT_TERMS)
 
 def contains_blacklist(text):
     t = text.lower()
-    return any(word in t for word in BLACKLIST_WORDS)
+    return any(re.search(rf'\\b{re.escape(word)}\\b', t) for word in BLACKLIST_WORDS)
 
 @bot.event
 async def on_message(msg):
