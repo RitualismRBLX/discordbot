@@ -1539,7 +1539,32 @@ async def _post_announcement(ctx, event_type, name, game_name, time_str, target_
         "unix_ts": unix_ts,
         "num": num
     }
+    # Schedule auto-ping at event start time
+    asyncio.create_task(_auto_ping_at_start(msg.id, ctx.author.id, roblox_id, unix_ts))
     await ctx.send(f"{event_type.upper()} #{num} posted in {ch.mention}.")
+
+async def _auto_ping_at_start(msg_id, host_id, roblox_id, unix_ts):
+    now = datetime.datetime.utcnow().timestamp()
+    delay = unix_ts - now
+    if delay > 0:
+        await asyncio.sleep(delay)
+    ev = active_events.get(msg_id)
+    if not ev:
+        return  # Already ended/removed
+    ch = bot.get_channel(ev["channel_id"])
+    if not ch:
+        return
+    link = f"https://www.roblox.com/users/{roblox_id}/profile"
+    pings = [f"<@{uid}>" for uid in ev["reactors"] if uid != host_id]
+    ping_text = f"{' '.join(pings[:75])}" if pings else ""
+    e = discord.Embed(title=f"🚀 {ev['name']} is STARTING NOW!", color=discord.Color.red())
+    e.add_field(name="Host Roblox", value=link, inline=False)
+    e.add_field(name="Reactors", value=str(len(pings)), inline=False)
+    e.set_footer(text=f"#{ev['num']} {ev['type'].upper()}")
+    try:
+        await ch.send(ping_text, embed=e)
+    except Exception:
+        pass
 
 async def _start_ping(ctx, event_type, number_str: str):
     if not number_str.startswith("#"):
