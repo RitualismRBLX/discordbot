@@ -46,7 +46,7 @@ class UnifiedCursor:
         if self._is_pg:
             operation = operation.replace("?", "%s")
             op_upper = operation.strip().upper()
-            no_id_tables = {"levels", "tags", "roblox_verify"}
+            no_id_tables = {"levels", "tags", "roblox_verify", "roster", "kos_challenges"}
             if op_upper.startswith("INSERT") and "RETURNING" not in op_upper:
                 parts = operation.strip().split()
                 tbl = ""
@@ -120,7 +120,7 @@ def init_db():
             "CREATE TABLE IF NOT EXISTS applications(id SERIAL PRIMARY KEY,user_id BIGINT,guild_id BIGINT,content TEXT,status TEXT DEFAULT 'pending',ts TEXT,message_id BIGINT)",
             "CREATE TABLE IF NOT EXISTS invites(id SERIAL PRIMARY KEY,inviter_id BIGINT,invitee_id BIGINT,guild_id BIGINT,code TEXT,ts TEXT)",
             "CREATE TABLE IF NOT EXISTS roblox_verify(user_id BIGINT PRIMARY KEY,roblox_id BIGINT,roblox_username TEXT,verified_ts TEXT)",
-            "CREATE TABLE IF NOT EXISTS tickets(id SERIAL PRIMARY KEY,guild_id BIGINT,channel_id BIGINT UNIQUE,user_id BIGINT,claimer_id BIGINT,status TEXT DEFAULT 'open',created_ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS tickets(id SERIAL PRIMARY KEY,guild_id BIGINT,channel_id BIGINT UNIQUE,user_id BIGINT,claimer_id BIGINT,status TEXT DEFAULT 'open',created_ts TEXT,ticket_type TEXT)",
             "CREATE TABLE IF NOT EXISTS activity_checks(id SERIAL PRIMARY KEY,guild_id BIGINT,message_id BIGINT,channel_id BIGINT,ts TEXT)",
             "CREATE TABLE IF NOT EXISTS event_logs(id SERIAL PRIMARY KEY,num BIGINT,event_type TEXT,name TEXT,game_name TEXT,host_id BIGINT,guild_id BIGINT,channel_id BIGINT,message_id BIGINT,start_ts TEXT,end_ts TEXT,attendees TEXT,no_shows TEXT)",
             "CREATE TABLE IF NOT EXISTS war_logs(id SERIAL PRIMARY KEY,result TEXT,opponent TEXT,score TEXT,mvps TEXT,image_url TEXT,guild_id BIGINT,ts TEXT,mod_id BIGINT)",
@@ -134,6 +134,9 @@ def init_db():
             "CREATE TABLE IF NOT EXISTS app_votes(id SERIAL PRIMARY KEY,app_id BIGINT,voter_id BIGINT,guild_id BIGINT,vote TEXT,ts TEXT)",
             "CREATE TABLE IF NOT EXISTS last_seen(id SERIAL PRIMARY KEY,user_id BIGINT,guild_id BIGINT,ts TEXT)",
             "CREATE TABLE IF NOT EXISTS afk(id SERIAL PRIMARY KEY,user_id BIGINT,guild_id BIGINT,reason TEXT,ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS roster(user_id BIGINT, guild_id BIGINT, PRIMARY KEY(user_id, guild_id))",
+            "CREATE TABLE IF NOT EXISTS roster_config(guild_id BIGINT PRIMARY KEY, channel_id BIGINT, message_id BIGINT)",
+            "CREATE TABLE IF NOT EXISTS kos_challenges(id SERIAL PRIMARY KEY, guild_id BIGINT, channel_id BIGINT, challenger_id BIGINT, defender_id BIGINT, expiry_ts TEXT, status TEXT DEFAULT 'active')"
         ]
         for sql in pg_tables:
             c.execute(sql)
@@ -151,7 +154,7 @@ def init_db():
             "CREATE TABLE IF NOT EXISTS applications(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,content TEXT,status TEXT DEFAULT 'pending',ts TEXT,message_id INT)",
             "CREATE TABLE IF NOT EXISTS invites(id INTEGER PRIMARY KEY,inviter_id INT,invitee_id INT,guild_id INT,code TEXT,ts TEXT)",
             "CREATE TABLE IF NOT EXISTS roblox_verify(user_id INT PRIMARY KEY,roblox_id INT,roblox_username TEXT,verified_ts TEXT)",
-            "CREATE TABLE IF NOT EXISTS tickets(id INTEGER PRIMARY KEY,guild_id INT,channel_id INT UNIQUE,user_id INT,claimer_id INT,status TEXT DEFAULT 'open',created_ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS tickets(id INTEGER PRIMARY KEY,guild_id INT,channel_id INT UNIQUE,user_id INT,claimer_id INT,status TEXT DEFAULT 'open',created_ts TEXT,ticket_type TEXT)",
             "CREATE TABLE IF NOT EXISTS activity_checks(id INTEGER PRIMARY KEY,guild_id INT,message_id INT,channel_id INT,ts TEXT)",
             "CREATE TABLE IF NOT EXISTS event_logs(id INTEGER PRIMARY KEY,num INTEGER,event_type TEXT,name TEXT,game_name TEXT,host_id INT,guild_id INT,channel_id INT,message_id INT,start_ts TEXT,end_ts TEXT,attendees TEXT,no_shows TEXT)",
             "CREATE TABLE IF NOT EXISTS war_logs(id INTEGER PRIMARY KEY,result TEXT,opponent TEXT,score TEXT,mvps TEXT,image_url TEXT,guild_id INT,ts TEXT,mod_id INT)",
@@ -165,13 +168,16 @@ def init_db():
             "CREATE TABLE IF NOT EXISTS app_votes(id INTEGER PRIMARY KEY,app_id INT,voter_id INT,guild_id INT,vote TEXT,ts TEXT)",
             "CREATE TABLE IF NOT EXISTS last_seen(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,ts TEXT)",
             "CREATE TABLE IF NOT EXISTS afk(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,reason TEXT,ts TEXT)",
+            "CREATE TABLE IF NOT EXISTS roster(user_id INT, guild_id INT, PRIMARY KEY(user_id, guild_id))",
+            "CREATE TABLE IF NOT EXISTS roster_config(guild_id INT PRIMARY KEY, channel_id INT, message_id INT)",
+            "CREATE TABLE IF NOT EXISTS kos_challenges(id INTEGER PRIMARY KEY, guild_id INT, channel_id INT, challenger_id INT, defender_id INT, expiry_ts TEXT, status TEXT DEFAULT 'active')"
         ]
         for t in sqlite_tables:
             c.execute(t)
-        for col in ("log_channel_id", "log_message_id"):
+        for col in ("log_channel_id", "log_message_id", "ticket_type"):
             try: c.execute(f"ALTER TABLE strikes ADD COLUMN {col} INTEGER")
             except sqlite3.OperationalError: pass
-        try: c.execute("ALTER TABLE event_logs ADD COLUMN num INTEGER")
+        try: c.execute("ALTER TABLE tickets ADD COLUMN ticket_type TEXT")
         except sqlite3.OperationalError: pass
     conn.commit()
     conn.close()
@@ -277,6 +283,84 @@ async def check_tempbans():
         except Exception: pass
     conn.close()
 
+async def check_kos_expiry():
+    await bot.wait_until_ready()
+    while True:
+        await asyncio.sleep(60)
+        now = datetime.datetime.utcnow()
+        conn = db(); c = conn.cursor()
+        c.execute("SELECT id, guild_id, channel_id, challenger_id, defender_id FROM kos_challenges WHERE status='active' AND expiry_ts <= ?", (now.isoformat(),))
+        expired = c.fetchall()
+        for row in expired:
+            cid, gid, ch_id, challenger_id, defender_id = row["id"], row["guild_id"], row["channel_id"], row["challenger_id"], row["defender_id"]
+            guild = bot.get_guild(gid)
+            if guild:
+                role = get_role_by_name(guild, "SIN | War Assembly")
+                defender = guild.get_member(defender_id)
+                challenger = guild.get_member(challenger_id)
+                if role:
+                    if defender and role in defender.roles:
+                        try: await defender.remove_roles(role)
+                        except Exception: pass
+                    if challenger:
+                        try: await challenger.add_roles(role)
+                        except Exception: pass
+                        # Update Roster
+                        c.execute("DELETE FROM roster WHERE user_id=? AND guild_id=?", (defender_id, gid))
+                        c.execute("INSERT OR IGNORE INTO roster (user_id, guild_id) VALUES (?, ?)", (challenger_id, gid))
+                        conn.commit()
+                        await update_roster_message(guild)
+                ch = guild.get_channel(ch_id)
+                if ch:
+                    try:
+                        await ch.send(f"⏰ **24 hours have elapsed without verification!** Defender (<@{defender_id}>) automatically loses the role, and Challenger (<@{challenger_id}>) is awarded the war spot.")
+                    except Exception: pass
+            c.execute("UPDATE kos_challenges SET status='expired' WHERE id=?", (cid,))
+            conn.commit()
+        conn.close()
+
+async def update_roster_message(guild):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT channel_id, message_id FROM roster_config WHERE guild_id=?", (guild.id,))
+    cfg = c.fetchone()
+    c.execute("SELECT user_id FROM roster WHERE guild_id=?", (guild.id,))
+    rows = c.fetchall()
+    conn.close()
+    if not cfg or not cfg["channel_id"]:
+        return
+    ch = guild.get_channel(cfg["channel_id"])
+    if not ch:
+        return
+    members_text = []
+    role = get_role_by_name(guild, "SIN | War Assembly")
+    for r in rows:
+        m = guild.get_member(r["user_id"])
+        if m:
+            members_text.append(f"• {m.mention} (`{m.name}`)")
+        else:
+            members_text.append(f"• <@{r['user_id']}>")
+    
+    e = discord.Embed(title="⚔️ Sinister Cartel — War Assembly Roster", color=discord.Color.red())
+    e.description = "\n".join(members_text) if members_text else "No members on roster yet."
+    e.set_footer(text=f"Total Roster: {len(rows)}/8 players")
+
+    try:
+        msg = None
+        if cfg["message_id"]:
+            try:
+                msg = await ch.fetch_message(cfg["message_id"])
+            except Exception:
+                msg = None
+        if msg:
+            await msg.edit(embed=e)
+        else:
+            new_msg = await ch.send(embed=e)
+            conn = db(); c = conn.cursor()
+            c.execute("UPDATE roster_config SET message_id=? WHERE guild_id=?", (new_msg.id, guild.id))
+            conn.commit(); conn.close()
+    except Exception:
+        pass
+
 async def auto_close_tickets():
     await bot.wait_until_ready()
     while True:
@@ -343,6 +427,7 @@ async def cache_invites(guild):
 async def on_ready():
     init_db()
     await check_tempbans()
+    bot.loop.create_task(check_kos_expiry())
     for guild in bot.guilds:
         await cache_invites(guild)
     bot.loop.create_task(daily_activity_check())
@@ -1265,8 +1350,95 @@ async def inviteleaderboard(ctx):
     await ctx.send(embed=e)
 
 @bot.command()
-async def ticket(ctx, *, reason="No reason provided"):
+async def setuproster(ctx):
+    if not has_role_or_higher(ctx.author, "Owner") and ctx.author.id != ctx.guild.owner_id:
+        return await ctx.send("Owner+ only.")
+    await ctx.send("Send me the list of users for the roster (e.g., `@user @user @user ...`, max 8 players). You have 60 seconds.")
+    def check(m):
+        return m.author == ctx.author and m.channel == ctx.channel
+    try:
+        msg = await bot.wait_for('message', check=check, timeout=60)
+    except asyncio.TimeoutError:
+        return await ctx.send("Timed out setting up roster.")
+    
+    mentions = msg.mentions[:8]
+    if not mentions:
+        return await ctx.send("No valid user mentions found. Setup cancelled.")
+    
+    conn = db(); c = conn.cursor()
+    c.execute("DELETE FROM roster WHERE guild_id=?", (ctx.guild.id,))
+    for m in mentions:
+        c.execute("INSERT OR IGNORE INTO roster (user_id, guild_id) VALUES (?, ?)", (m.id, ctx.guild.id))
+    
+    cat = discord.utils.get(ctx.guild.categories, name="War") or await ctx.guild.create_category("War")
+    roster_ch = discord.utils.get(ctx.guild.text_channels, name="『📋』roster")
+    if not roster_ch:
+        roster_ch = await ctx.guild.create_text_channel("『📋』roster", category=cat)
+    
+    c.execute("INSERT INTO roster_config (guild_id, channel_id, message_id) VALUES (?, ?, NULL) ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id, message_id=NULL", (ctx.guild.id, roster_ch.id))
+    conn.commit(); conn.close()
+
+    role = get_role_by_name(ctx.guild, "SIN | War Assembly")
+    if role:
+        for m in mentions:
+            try: await m.add_roles(role)
+            except Exception: pass
+
+    await update_roster_message(ctx.guild)
+    await ctx.send(f"Roster successfully initialized with {len(mentions)} players! Posted in {roster_ch.mention}.")
+
+@bot.command()
+@require_role("STAFF")
+async def verifykos(ctx, winner: discord.Member):
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT id, challenger_id, defender_id FROM kos_challenges WHERE channel_id=? AND status='active'", (ctx.channel.id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return await ctx.send("This is not an active Warspot KOS channel awaiting verification.")
+    
+    cid, challenger_id, defender_id = row["id"], row["challenger_id"], row["defender_id"]
+    if winner.id not in (challenger_id, defender_id):
+        conn.close()
+        return await ctx.send("Winner must be either the challenger or the original defender.")
+    
     guild = ctx.guild
+    role = get_role_by_name(guild, "SIN | War Assembly")
+    challenger = guild.get_member(challenger_id)
+    defender = guild.get_member(defender_id)
+
+    if winner.id == challenger_id:
+        if role:
+            if defender:
+                try: await defender.remove_roles(role)
+                except Exception: pass
+            if challenger:
+                try: await challenger.add_roles(role)
+                except Exception: pass
+        c.execute("DELETE FROM roster WHERE user_id=? AND guild_id=?", (defender_id, guild.id))
+        c.execute("INSERT OR IGNORE INTO roster (user_id, guild_id) VALUES (?, ?)", (challenger_id, guild.id))
+        await ctx.send(f"🎉 **Challenger ({winner.mention}) won the KOS!** They have been awarded the `SIN | War Assembly` role, and the roster has been updated.")
+    else:
+        if role and defender:
+            try: await defender.add_roles(role)
+            except Exception: pass
+        await ctx.send(f"🛡️ **Defender ({winner.mention}) successfully defended their role!** They retain the `SIN | War Assembly` role.")
+
+    c.execute("UPDATE kos_challenges SET status='verified' WHERE id=?", (cid,))
+    conn.commit(); conn.close()
+    await update_roster_message(guild)
+
+@bot.command()
+async def ticket(ctx, *, ticket_type: str = ""):
+    guild = ctx.guild
+    valid_types = ["support", "warspot", "report", "purchase", "other"]
+    t_clean = ticket_type.strip().lower()
+
+    if t_clean not in valid_types:
+        return await ctx.send("Usage: `%ticket Support`, `%ticket Warspot`, `%ticket Report`, `%ticket Purchase`, or `%ticket Other`")
+
+    open_cat = discord.utils.get(guild.categories, name="Open Tickets") or await guild.create_category("Open Tickets")
+    
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
         ctx.author: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
@@ -1274,24 +1446,81 @@ async def ticket(ctx, *, reason="No reason provided"):
     for role in guild.roles:
         if role.name == "STAFF":
             overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
+
+    channel_name = f"{t_clean}-{ctx.author.name}"
     try:
-        ch = await guild.create_text_channel(f"ticket-{ctx.author.name}", overwrites=overwrites, reason=f"Ticket by {ctx.author}: {reason}")
+        ch = await guild.create_text_channel(channel_name, category=open_cat, overwrites=overwrites, reason=f"Ticket by {ctx.author}: {t_clean}")
     except discord.Forbidden:
         return await ctx.send("I don't have permission to create channels.")
+
     conn = db(); c = conn.cursor()
-    c.execute("INSERT INTO tickets (guild_id, channel_id, user_id, created_ts) VALUES (?,?,?,?)",
-              (guild.id, ch.id, ctx.author.id, datetime.datetime.utcnow().isoformat()))
+    c.execute("INSERT INTO tickets (guild_id, channel_id, user_id, created_ts, ticket_type) VALUES (?,?,?,?,?)",
+              (guild.id, ch.id, ctx.author.id, datetime.datetime.utcnow().isoformat(), t_clean))
     conn.commit(); conn.close()
-    await ch.send(f"{ctx.author.mention} Ticket created. Reason: `{reason}`\nStaff can use `%claim` to take ownership and `%rename <name>` to rename this channel.")
-    log_ch = get_log_channel(guild, "ticket-logs")
-    if log_ch:
-        await log_ch.send(f"Ticket created by {ctx.author.mention} in {ch.mention} | Reason: `{reason}`")
+
+    if t_clean == "support":
+        staff_role = get_role_by_name(guild, "STAFF")
+        mention = staff_role.mention if staff_role else "@STAFF"
+        await ch.send(f"{mention} {ctx.author.mention}\nExplain your issue and wait for our staff team to respond.")
+    elif t_clean == "purchase":
+        batman_role = get_role_by_name(guild, "Batman")
+        mention = batman_role.mention if batman_role else "@Batman"
+        await ch.send(f"{mention} {ctx.author.mention}\nPlease let us know what you would like to purchase and wait for Sway to respond.")
+    elif t_clean == "report":
+        admin_roles = [r for r in guild.roles if r.name in ("Admin", "Head Admin", "Manager | 2nd in command", "Owner") or r.permissions.administrator]
+        mentions = " ".join(r.mention for r in admin_roles) if admin_roles else "@Admin"
+        await ch.send(f"{mentions} {ctx.author.mention}\nPlease send the report in the following format:\n\nUser ; user\nReason for report ; reason\nProof ; proof")
+    elif t_clean == "other":
+        staff_role = get_role_by_name(guild, "STAFF")
+        mention = staff_role.mention if staff_role else "@STAFF"
+        await ch.send(f"{mention} {ctx.author.mention}\nPlease wait patiently for help.")
+    elif t_clean == "warspot":
+        await ch.send(f"Hello {ctx.author.mention}, please mention the user you are requesting to KOS for Warspot. Use the FULL discord username or ID of the user you are requesting.")
+        
+        def check(m):
+            return m.author == ctx.author and m.channel == ch
+        try:
+            resp = await bot.wait_for('message', check=check, timeout=300)
+        except asyncio.TimeoutError:
+            return await ch.send("Timed out waiting for KOS user request.")
+        
+        target_member = None
+        if resp.mentions:
+            target_member = resp.mentions[0]
+        else:
+            try:
+                uid = int(resp.content.strip().lstrip("<@!>"))
+                target_member = guild.get_member(uid) or await guild.fetch_member(uid)
+            except Exception:
+                pass
+        
+        if not target_member:
+            return await ch.send("Could not find that user. Please restart the ticket.")
+        
+        role = get_role_by_name(guild, "SIN | War Assembly")
+        if role and role not in target_member.roles:
+            await ch.send(f"⚠️ Warning: {target_member.mention} does not currently have the `SIN | War Assembly` role, but proceeding with challenge flow.")
+
+        try:
+            await ch.set_permissions(target_member, view_channel=True, send_messages=True, read_message_history=True)
+        except Exception: pass
+
+        expiry = datetime.datetime.utcnow() + datetime.timedelta(hours=24)
+        conn = db(); c = conn.cursor()
+        c.execute("INSERT INTO kos_challenges (guild_id, channel_id, challenger_id, defender_id, expiry_ts, status) VALUES (?,?,?,?,?, 'active')",
+                  (guild.id, ch.id, ctx.author.id, target_member.id, expiry.isoformat()))
+        conn.commit(); conn.close()
+
+        staff_role = get_role_by_name(guild, "STAFF")
+        s_mention = staff_role.mention if staff_role else "@STAFF"
+        await ch.send(f"{target_member.mention} You have been requested to KOS for your warspot! You have 24 hours to defend your spot.\n{s_mention} A staff member must review and use `%verifykos # @winner` when complete.")
+
     await ctx.send(f"Ticket created: {ch.mention}", delete_after=10)
 
 @bot.command()
 @require_role("STAFF")
 async def claim(ctx):
-    if not ctx.channel.name.startswith("ticket-"):
+    if not ctx.channel.name.startswith(("support-", "warspot-", "report-", "purchase-", "other-", "ticket-")):
         return await ctx.send("This command only works in ticket channels.")
     conn = db(); c = conn.cursor()
     c.execute("UPDATE tickets SET claimer_id=? WHERE channel_id=?", (ctx.author.id, ctx.channel.id))
@@ -1301,18 +1530,19 @@ async def claim(ctx):
 @bot.command()
 @require_role("STAFF")
 async def rename(ctx, *, new_name):
-    if not ctx.channel.name.startswith("ticket-"):
+    if not ctx.channel.name.startswith(("support-", "warspot-", "report-", "purchase-", "other-", "ticket-")):
         return await ctx.send("This command only works in ticket channels.")
     try:
-        await ctx.channel.edit(name=f"ticket-{new_name}")
-        await ctx.send(f"Renamed to `ticket-{new_name}`.")
+        prefix = ctx.channel.name.split("-")[0]
+        await ctx.channel.edit(name=f"{prefix}-{new_name}")
+        await ctx.send(f"Renamed channel.")
     except discord.Forbidden:
         await ctx.send("Missing permissions to rename channel.")
 
 @bot.command()
 @require_role("STAFF")
 async def add(ctx, member: discord.Member):
-    if not ctx.channel.name.startswith("ticket-"):
+    if not ctx.channel.name.startswith(("support-", "warspot-", "report-", "purchase-", "other-", "ticket-")):
         return await ctx.send("This command only works in ticket channels.")
     try:
         await ctx.channel.set_permissions(member, view_channel=True, send_messages=True, read_message_history=True)
@@ -1323,7 +1553,7 @@ async def add(ctx, member: discord.Member):
 @bot.command()
 @require_role("STAFF")
 async def remove(ctx, member: discord.Member):
-    if not ctx.channel.name.startswith("ticket-"):
+    if not ctx.channel.name.startswith(("support-", "warspot-", "report-", "purchase-", "other-", "ticket-")):
         return await ctx.send("This command only works in ticket channels.")
     try:
         await ctx.channel.set_permissions(member, overwrite=None)
@@ -1334,7 +1564,7 @@ async def remove(ctx, member: discord.Member):
 @bot.command()
 @require_role("STAFF")
 async def close(ctx, *, reason="No reason provided"):
-    if not ctx.channel.name.startswith("ticket-"):
+    if not ctx.channel.name.startswith(("support-", "warspot-", "report-", "purchase-", "other-", "ticket-")):
         return await ctx.send("This command only works in ticket channels.")
     ch = ctx.channel
     transcript = []
@@ -1377,6 +1607,11 @@ async def warrank(ctx, member: discord.Member, *, rank: str):
         return await ctx.send(f"Role `{role_name}` not found in the server.")
     try:
         await member.add_roles(role)
+        if rank == "assembly":
+            conn = db(); c = conn.cursor()
+            c.execute("INSERT OR IGNORE INTO roster (user_id, guild_id) VALUES (?, ?)", (member.id, ctx.guild.id))
+            conn.commit(); conn.close()
+            await update_roster_message(ctx.guild)
         await ctx.send(f"Assigned **{role_name}** to {member.mention}.")
     except discord.Forbidden:
         await ctx.send("Missing permissions to assign role.")
@@ -1687,20 +1922,11 @@ async def raidcancel(ctx, number: str, *, reason: str):
 @bot.command()
 async def help(ctx):
     e = discord.Embed(title="Command List — Sinister Cartel", color=discord.Color.blurple())
-    e.add_field(name="Moderation", value="**Manager+**: unban, ban, tempban\n**Head Admin+**: kick, nick, addrole, removerole, promote, demote\n**Admin+**: purge, slowmode, lock, unlock, lockdown, unlockdown, accept/deny member apps\n**Moderator+**: mute, unmute, tempmute\n**STAFF+**: warn, warnlist, unwarn, clearwarnings, strike, removestrike, modstats, note, notes (warns auto-decay after 14 days)", inline=False)
-    e.add_field(name="Fun", value="8ball, coinflip, roll, rps, choose, rate, reverse, mock, cat, dog, meme", inline=False)
-    e.add_field(name="Utility", value="avatar, userinfo, serverinfo, roleinfo, channelinfo, emojiinfo, ping, invite, say, embed, poll, remind, timer, inviteleaderboard, activity, attendance, topattendees, warstats, quote, quotes, seen, uptime", inline=False)
-    e.add_field(name="Auto Features", value="Auto-role: OUTSIDER & UNRANKED | Welcome/Leave: #welcoming | Message Logging: #message-logs | Warn Decay: 14 days | Alt Detection: <7 days | Nuke Protection | Inactivity Purge | Cmd Cooldown (3s) | @everyone cooldown (30m)", inline=False)
-    e.add_field(name="Tags", value="tag, tagcreate, tagedit, tagdelete, taglist, taginfo", inline=False)
-    e.add_field(name="Invites", value="invites, inviteleaderboard", inline=False)
-    e.add_field(name="Applications", value="apply, staffapply, pendingapps, review (Admin+ for members, Manager+ for staff)", inline=False)
-    e.add_field(name="Tickets", value="ticket, claim, rename, add, remove, close (STAFF+)", inline=False)
-    e.add_field(name="War Ranks", value="warrank (Head Admin+), warwin, warloss (STAFF+)", inline=False)
-    e.add_field(name="Events", value="`%event <name> <time>` → `%eventstart #N` → `%eventend #N` / `%eventcancel #N <reason>` (STAFF+)", inline=False)
-    e.add_field(name="Deployments", value="`%deployment <game> <time>` → `%deploymentstart #N` → `%deploymentend #N` / `%deploymentcancel #N <reason>` (STAFF+)", inline=False)
-    e.add_field(name="Raids", value="`%raid <game> <time>` → `%raidstart #N` → `%raidend #N` / `%raidcancel #N <reason>` (STAFF+)", inline=False)
-    e.add_field(name="Engagement", value="suggest, giveaway (STAFF+), sticky (STAFF+), archive (STAFF+), vclobby (STAFF+), afk", inline=False)
-    e.add_field(name="Roblox", value="verifyroblox", inline=False)
+    e.add_field(name="Moderation", value="**Manager+**: unban, ban, tempban\n**Head Admin+**: kick, nick, addrole, removerole, promote, demote\n**Admin+**: purge, slowmode, lock, unlock, lockdown, unlockdown, accept/deny member apps\n**Moderator+**: mute, unmute, tempmute\n**STAFF+**: warn, warnlist, unwarn, clearwarnings, strike, removestrike, modstats, note, notes", inline=False)
+    e.add_field(name="Tickets & War", value="`%ticket <Support|Warspot|Report|Purchase|Other>`\n`%verifykos # @winner` (STAFF+)\n`%setuproster` (Owner+)", inline=False)
+    e.add_field(name="Fun & Utility", value="8ball, coinflip, roll, rps, choose, rate, reverse, mock, cat, dog, meme, avatar, userinfo, serverinfo, ping, invite, say, embed, poll, remind, timer, invites, inviteleaderboard, activity, attendance, topattendees, warstats, quote, quotes, seen, uptime", inline=False)
+    e.add_field(name="Tags & Ranks", value="tag, tagcreate, tagedit, tagdelete, taglist, taginfo, warrank, warwin, warloss", inline=False)
+    e.add_field(name="Events", value="event, eventstart, eventend, eventcancel, deployment, deploymentstart, deploymentend, deploymentcancel, raid, raidstart, raidend, raidcancel", inline=False)
     await ctx.send(embed=e)
 
 @bot.command()
@@ -1867,6 +2093,11 @@ async def promote(ctx, member: discord.Member, *, role_name: str):
         return await ctx.send(f"Role `{role_name}` not found.")
     try:
         await member.add_roles(role)
+        if role_name.lower() in ("sin | war assembly", "assembly"):
+            conn = db(); c = conn.cursor()
+            c.execute("INSERT OR IGNORE INTO roster (user_id, guild_id) VALUES (?, ?)", (member.id, ctx.guild.id))
+            conn.commit(); conn.close()
+            await update_roster_message(ctx.guild)
         log_ch = get_log_channel(ctx.guild, "promo-logs")
         if log_ch:
             ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
@@ -1885,6 +2116,11 @@ async def demote(ctx, member: discord.Member, *, role_name: str):
         return await ctx.send(f"{member.mention} does not have that role.")
     try:
         await member.remove_roles(role)
+        if role_name.lower() in ("sin | war assembly", "assembly"):
+            conn = db(); c = conn.cursor()
+            c.execute("DELETE FROM roster WHERE user_id=? AND guild_id=?", (member.id, ctx.guild.id))
+            conn.commit(); conn.close()
+            await update_roster_message(ctx.guild)
         log_ch = get_log_channel(ctx.guild, "promo-logs")
         if log_ch:
             ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
@@ -2054,8 +2290,14 @@ async def addrole(ctx, role: discord.Role, *members: discord.Member):
         try:
             await m.add_roles(role)
             added += 1
+            if role.name.lower() == "sin | war assembly":
+                conn = db(); c = conn.cursor()
+                c.execute("INSERT OR IGNORE INTO roster (user_id, guild_id) VALUES (?, ?)", (m.id, ctx.guild.id))
+                conn.commit(); conn.close()
         except Exception:
             pass
+    if role.name.lower() == "sin | war assembly":
+        await update_roster_message(ctx.guild)
     await ctx.send(f"Added **{role.name}** to {added}/{len(members)} user(s).")
 
 @bot.command()
@@ -2068,8 +2310,14 @@ async def removerole(ctx, role: discord.Role, *members: discord.Member):
         try:
             await m.remove_roles(role)
             removed += 1
+            if role.name.lower() == "sin | war assembly":
+                conn = db(); c = conn.cursor()
+                c.execute("DELETE FROM roster WHERE user_id=? AND guild_id=?", (m.id, ctx.guild.id))
+                conn.commit(); conn.close()
         except Exception:
             pass
+    if role.name.lower() == "sin | war assembly":
+        await update_roster_message(ctx.guild)
     await ctx.send(f"Removed **{role.name}** from {removed}/{len(members)} user(s).")
 
 @bot.command()
@@ -2176,7 +2424,6 @@ async def _run_application(ctx, app_type, questions):
         await dm.send(f"Answers for question(s) {', '.join(bad)} are too short or lazy. Run the command again with real answers.")
         return
     
-    # Format cleanly as: 1. Question : Answer for both member and staff applications
     formatted_lines = []
     for n in range(1, len(questions) + 1):
         q_clean = questions[n - 1].replace(":", "").strip()
