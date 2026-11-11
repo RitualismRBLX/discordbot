@@ -305,9 +305,12 @@ async def check_kos_expiry():
                     if challenger:
                         try: await challenger.add_roles(role)
                         except Exception: pass
-                        # Update Roster
+                        # Update Roster (PostgreSQL/SQLite safe syntax)
                         c.execute("DELETE FROM roster WHERE user_id=? AND guild_id=?", (defender_id, gid))
-                        c.execute("INSERT OR IGNORE INTO roster (user_id, guild_id) VALUES (?, ?)", (challenger_id, gid))
+                        if IS_PG:
+                            c.execute("INSERT INTO roster (user_id, guild_id) VALUES (?, ?) ON CONFLICT (user_id, guild_id) DO NOTHING", (challenger_id, gid))
+                        else:
+                            c.execute("INSERT OR IGNORE INTO roster (user_id, guild_id) VALUES (?, ?)", (challenger_id, gid))
                         conn.commit()
                         await update_roster_message(guild)
                 ch = guild.get_channel(ch_id)
@@ -332,7 +335,6 @@ async def update_roster_message(guild):
     if not ch:
         return
     members_text = []
-    role = get_role_by_name(guild, "SIN | War Assembly")
     for r in rows:
         m = guild.get_member(r["user_id"])
         if m:
@@ -1368,7 +1370,10 @@ async def setuproster(ctx):
     conn = db(); c = conn.cursor()
     c.execute("DELETE FROM roster WHERE guild_id=?", (ctx.guild.id,))
     for m in mentions:
-        c.execute("INSERT OR IGNORE INTO roster (user_id, guild_id) VALUES (?, ?)", (m.id, ctx.guild.id))
+        if IS_PG:
+            c.execute("INSERT INTO roster (user_id, guild_id) VALUES (?, ?) ON CONFLICT (user_id, guild_id) DO NOTHING", (m.id, ctx.guild.id))
+        else:
+            c.execute("INSERT OR IGNORE INTO roster (user_id, guild_id) VALUES (?, ?)", (m.id, ctx.guild.id))
     
     cat = discord.utils.get(ctx.guild.categories, name="War") or await ctx.guild.create_category("War")
     roster_ch = discord.utils.get(ctx.guild.text_channels, name="『📋』roster")
@@ -1416,7 +1421,10 @@ async def verifykos(ctx, winner: discord.Member):
                 try: await challenger.add_roles(role)
                 except Exception: pass
         c.execute("DELETE FROM roster WHERE user_id=? AND guild_id=?", (defender_id, guild.id))
-        c.execute("INSERT OR IGNORE INTO roster (user_id, guild_id) VALUES (?, ?)", (challenger_id, guild.id))
+        if IS_PG:
+            c.execute("INSERT INTO roster (user_id, guild_id) VALUES (?, ?) ON CONFLICT (user_id, guild_id) DO NOTHING", (challenger_id, guild.id))
+        else:
+            c.execute("INSERT OR IGNORE INTO roster (user_id, guild_id) VALUES (?, ?)", (challenger_id, guild.id))
         await ctx.send(f"🎉 **Challenger ({winner.mention}) won the KOS!** They have been awarded the `SIN | War Assembly` role, and the roster has been updated.")
     else:
         if role and defender:
@@ -1609,7 +1617,10 @@ async def warrank(ctx, member: discord.Member, *, rank: str):
         await member.add_roles(role)
         if rank == "assembly":
             conn = db(); c = conn.cursor()
-            c.execute("INSERT OR IGNORE INTO roster (user_id, guild_id) VALUES (?, ?)", (member.id, ctx.guild.id))
+            if IS_PG:
+                c.execute("INSERT INTO roster (user_id, guild_id) VALUES (?, ?) ON CONFLICT (user_id, guild_id) DO NOTHING", (member.id, ctx.guild.id))
+            else:
+                c.execute("INSERT OR IGNORE INTO roster (user_id, guild_id) VALUES (?, ?)", (member.id, ctx.guild.id))
             conn.commit(); conn.close()
             await update_roster_message(ctx.guild)
         await ctx.send(f"Assigned **{role_name}** to {member.mention}.")
@@ -2095,7 +2106,10 @@ async def promote(ctx, member: discord.Member, *, role_name: str):
         await member.add_roles(role)
         if role_name.lower() in ("sin | war assembly", "assembly"):
             conn = db(); c = conn.cursor()
-            c.execute("INSERT OR IGNORE INTO roster (user_id, guild_id) VALUES (?, ?)", (member.id, ctx.guild.id))
+            if IS_PG:
+                c.execute("INSERT INTO roster (user_id, guild_id) VALUES (?, ?) ON CONFLICT (user_id, guild_id) DO NOTHING", (member.id, ctx.guild.id))
+            else:
+                c.execute("INSERT OR IGNORE INTO roster (user_id, guild_id) VALUES (?, ?)", (member.id, ctx.guild.id))
             conn.commit(); conn.close()
             await update_roster_message(ctx.guild)
         log_ch = get_log_channel(ctx.guild, "promo-logs")
@@ -2292,7 +2306,10 @@ async def addrole(ctx, role: discord.Role, *members: discord.Member):
             added += 1
             if role.name.lower() == "sin | war assembly":
                 conn = db(); c = conn.cursor()
-                c.execute("INSERT OR IGNORE INTO roster (user_id, guild_id) VALUES (?, ?)", (m.id, ctx.guild.id))
+                if IS_PG:
+                    c.execute("INSERT INTO roster (user_id, guild_id) VALUES (?, ?) ON CONFLICT (user_id, guild_id) DO NOTHING", (m.id, ctx.guild.id))
+                else:
+                    c.execute("INSERT OR IGNORE INTO roster (user_id, guild_id) VALUES (?, ?)", (m.id, ctx.guild.id))
                 conn.commit(); conn.close()
         except Exception:
             pass
