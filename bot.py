@@ -46,7 +46,8 @@ class UnifiedCursor:
         if self._is_pg:
             operation = operation.replace("?", "%s")
             op_upper = operation.strip().upper()
-            no_id_tables = {"levels", "tags", "roblox_verify", "roster", "kos_challenges"}
+            # Added "roster_config" to this set:
+            no_id_tables = {"levels", "tags", "roblox_verify", "roster", "kos_challenges", "roster_config"}
             if op_upper.startswith("INSERT") and "RETURNING" not in op_upper:
                 parts = operation.strip().split()
                 tbl = ""
