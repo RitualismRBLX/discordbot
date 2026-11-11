@@ -2175,7 +2175,13 @@ async def _run_application(ctx, app_type, questions):
     if bad:
         await dm.send(f"Answers for question(s) {', '.join(bad)} are too short or lazy. Run the command again with real answers.")
         return
-    formatted = "\n".join(f"**{n}.** {found[n]}" for n in range(1, len(questions)+1))
+    
+    # Format cleanly as: 1. Question : Answer for both member and staff applications
+    formatted_lines = []
+    for n in range(1, len(questions) + 1):
+        q_clean = questions[n - 1].replace(":", "").strip()
+        formatted_lines.append(f"**{n}. {q_clean}** : {found[n]}")
+    formatted = "\n".join(formatted_lines)
     
     target_channel_name = "staff-apps" if app_type == "staff" else "pending-applications"
     pending_ch = discord.utils.get(ctx.guild.text_channels, name=target_channel_name)
@@ -2189,7 +2195,7 @@ async def _run_application(ctx, app_type, questions):
     if app_type == "staff":
         conn = db(); c = conn.cursor()
         c.execute("INSERT INTO applications (user_id,guild_id,content,status,ts) VALUES (?,?,?,?,?)",
-                  (ctx.author.id, ctx.guild.id, msg.content, "pending", datetime.datetime.utcnow().isoformat()))
+                  (ctx.author.id, ctx.guild.id, formatted, "pending", datetime.datetime.utcnow().isoformat()))
         conn.commit()
         app_id = c.lastrowid if not IS_PG else None
         if IS_PG:
@@ -2197,7 +2203,7 @@ async def _run_application(ctx, app_type, questions):
             app_id = c.fetchone()["id"]
         conn.close()
 
-        e.description = f"**Applicant:** {ctx.author.mention}\n**Application ID:** #{app_id}"
+        e.description = formatted[:4000]
         e.set_footer(text="Manager+ use `%review staffapp #ID` to review privately in DMs.")
         manager_role = get_role_by_name(ctx.guild, "Manager | 2nd in command")
         mention = manager_role.mention if manager_role else "@Manager"
@@ -2210,7 +2216,7 @@ async def _run_application(ctx, app_type, questions):
         app_msg = await pending_ch.send(f"{mention} New Member Application {ctx.author.mention}", embed=e)
         conn = db(); c = conn.cursor()
         c.execute("INSERT INTO applications (user_id,guild_id,content,status,ts,message_id) VALUES (?,?,?,?,?,?)",
-                  (ctx.author.id, ctx.guild.id, msg.content, "pending", datetime.datetime.utcnow().isoformat(), app_msg.id))
+                  (ctx.author.id, ctx.guild.id, formatted, "pending", datetime.datetime.utcnow().isoformat(), app_msg.id))
         conn.commit(); conn.close()
 
     await dm.send("Your application has been submitted successfully! Server management will review it shortly.")
