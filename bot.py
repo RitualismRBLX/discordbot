@@ -46,7 +46,6 @@ class UnifiedCursor:
         if self._is_pg:
             operation = operation.replace("?", "%s")
             op_upper = operation.strip().upper()
-            # Added "roster_config" to this set:
             no_id_tables = {"levels", "tags", "roblox_verify", "roster", "kos_challenges", "roster_config"}
             if op_upper.startswith("INSERT") and "RETURNING" not in op_upper:
                 parts = operation.strip().split()
@@ -143,6 +142,15 @@ def init_db():
             c.execute(sql)
         try:
             c.execute("ALTER TABLE event_logs ADD COLUMN IF NOT EXISTS num BIGINT")
+        except Exception:
+            pass
+        try:
+            c.execute("ALTER TABLE tickets ADD COLUMN IF NOT EXISTS ticket_type TEXT")
+        except Exception:
+            pass
+        try:
+            c.execute("ALTER TABLE strikes ADD COLUMN IF NOT EXISTS log_channel_id BIGINT")
+            c.execute("ALTER TABLE strikes ADD COLUMN IF NOT EXISTS log_message_id BIGINT")
         except Exception:
             pass
     else:
@@ -306,7 +314,6 @@ async def check_kos_expiry():
                     if challenger:
                         try: await challenger.add_roles(role)
                         except Exception: pass
-                        # Update Roster (PostgreSQL/SQLite safe syntax)
                         c.execute("DELETE FROM roster WHERE user_id=? AND guild_id=?", (defender_id, gid))
                         if IS_PG:
                             c.execute("INSERT INTO roster (user_id, guild_id) VALUES (?, ?) ON CONFLICT (user_id, guild_id) DO NOTHING", (challenger_id, gid))
@@ -456,7 +463,10 @@ async def on_member_join(member):
             e.add_field(name="Account Created", value=member.created_at.strftime("%Y-%m-%d"), inline=False)
             e.add_field(name="Action", value="Use `%approve @user` or `%reject @user`", inline=False)
             await mod_ch.send(embed=e)
-        await member.send("Your account is too new. Staff must manually approve your join. Please wait.")
+        try:
+            await member.send("Your account is too new. Staff must manually approve your join. Please wait.")
+        except Exception:
+            pass
         return
     auto_role = get_role_by_name(guild, "OUTSIDER & UNRANKED")
     if auto_role:
@@ -615,7 +625,7 @@ async def on_guild_channel_delete(channel):
                     if mod_ch:
                         await mod_ch.send(f"@here 🚨 **NUKE ALERT**: {len(nuke_channel_deletes[guild.id])} channels deleted within 60 seconds! Potential raid in progress.")
                     for ch in guild.text_channels:
-                        if ch.id == (mod_ch.id if mod_ch else 0):
+                        if mod_ch and ch.id == mod_ch.id:
                             continue
                         try:
                             perms = ch.overwrites_for(guild.default_role)
@@ -959,7 +969,9 @@ async def warn(ctx, member: discord.Member, *, reason):
               (member.id,ctx.guild.id,reason,ctx.author.id,datetime.datetime.utcnow().isoformat()))
     conn.commit()
     c.execute("SELECT COUNT(*) FROM warns WHERE user_id=? AND guild_id=?", (member.id,ctx.guild.id))
-    n = c.fetchone()[0]; conn.close()
+    n_res = c.fetchone()
+    n = n_res[0] if n_res else 1
+    conn.close()
     await _log_punishment(ctx.guild, "warn", member, ctx.author, reason)
     await ctx.send(f"Warned {member.mention} (`{reason}`) — Total: {n}")
 
@@ -997,7 +1009,8 @@ async def unwarn(ctx, member: discord.Member):
 async def clearwarnings(ctx, member: discord.Member):
     conn = db(); c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM warns WHERE user_id=? AND guild_id=?", (member.id,ctx.guild.id))
-    n = c.fetchone()[0]
+    n_res = c.fetchone()
+    n = n_res[0] if n_res else 0
     c.execute("DELETE FROM warns WHERE user_id=? AND guild_id=?", (member.id,ctx.guild.id))
     conn.commit(); conn.close()
     await _log_punishment(ctx.guild, f"clearwarnings ({n} removed)", member, ctx.author, "")
@@ -1010,9 +1023,15 @@ async def strike(ctx, member: discord.Member, *, reason: str):
     conn = db(); c = conn.cursor()
     c.execute("INSERT INTO strikes (user_id,guild_id,reason,ts,mod_id) VALUES (?,?,?,?,?)",
               (member.id, ctx.guild.id, reason, now, ctx.author.id))
-    conn.commit(); sid = c.lastrowid
+    conn.commit()
+    sid = c.lastrowid
+    if not sid and IS_PG:
+        c.execute("SELECT id FROM strikes WHERE user_id=? AND guild_id=? ORDER BY id DESC LIMIT 1", (member.id, ctx.guild.id))
+        r_id = c.fetchone()
+        sid = r_id["id"] if r_id else None
     c.execute("SELECT COUNT(*) FROM strikes WHERE user_id=? AND guild_id=?", (member.id, ctx.guild.id))
-    count = c.fetchone()[0]
+    count_res = c.fetchone()
+    count = count_res[0] if count_res else 1
     conn.close()
     try:
         o = ctx.guild.owner
@@ -1023,9 +1042,10 @@ async def strike(ctx, member: discord.Member, *, reason: str):
     if log_ch:
         ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
         log_msg = await log_ch.send(f"[{ts}] action; strike ({count}/3) | user; {member.mention} | mod; {ctx.author.mention} | reason; {reason}")
-        conn = db(); c = conn.cursor()
-        c.execute("UPDATE strikes SET log_channel_id=?, log_message_id=? WHERE id=?", (log_ch.id, log_msg.id, sid))
-        conn.commit(); conn.close()
+        if sid:
+            conn = db(); c = conn.cursor()
+            c.execute("UPDATE strikes SET log_channel_id=?, log_message_id=? WHERE id=?", (log_ch.id, log_msg.id, sid))
+            conn.commit(); conn.close()
     if count >= 3:
         expiry = (datetime.datetime.utcnow() + datetime.timedelta(days=7)).isoformat()
         conn = db(); c = conn.cursor()
@@ -1052,10 +1072,12 @@ async def removestrike(ctx, member: discord.Member):
     if not row:
         conn.close()
         return await ctx.send("No strikes found for this user.")
-    sid, reason, lcid, lmid = row
+    sid, reason, lcid, lmid = row["id"], row["reason"], row["log_channel_id"], row["log_message_id"]
     c.execute("DELETE FROM strikes WHERE id=?", (sid,)); conn.commit()
     c.execute("SELECT COUNT(*) FROM strikes WHERE user_id=? AND guild_id=?", (member.id, ctx.guild.id))
-    count = c.fetchone()[0]; conn.close()
+    count_res = c.fetchone()
+    count = count_res[0] if count_res else 0
+    conn.close()
     await ctx.send(f"Removed 1 strike from {member.mention}. Current strikes: {count}/3.")
     await _log_punishment(ctx.guild, f"removestrike (revert) — was: {reason}", member, ctx.author, "")
     if lcid and lmid:
@@ -1245,7 +1267,9 @@ async def tag(ctx, name: str):
     conn = db(); c = conn.cursor()
     c.execute("SELECT content,uses FROM tags WHERE name=? AND guild_id=?", (name.lower(), ctx.guild.id))
     row = c.fetchone()
-    if not row: return await ctx.send("Tag not found."), conn.close()
+    if not row: 
+        conn.close()
+        return await ctx.send("Tag not found.")
     c.execute("UPDATE tags SET uses=uses+1 WHERE name=? AND guild_id=?", (name.lower(), ctx.guild.id))
     conn.commit(); conn.close()
     await ctx.send(row["content"])
@@ -1254,7 +1278,9 @@ async def tag(ctx, name: str):
 async def tagcreate(ctx, name: str, *, content):
     conn = db(); c = conn.cursor()
     c.execute("SELECT 1 FROM tags WHERE name=? AND guild_id=?", (name.lower(), ctx.guild.id))
-    if c.fetchone(): return await ctx.send("Tag already exists."), conn.close()
+    if c.fetchone(): 
+        conn.close()
+        return await ctx.send("Tag already exists.")
     c.execute("INSERT INTO tags VALUES (?,?,?,?,?,?)", (name.lower(), ctx.guild.id, content, ctx.author.id, 0, datetime.datetime.utcnow().isoformat()))
     conn.commit(); conn.close()
     await ctx.send(f"Tag `{name}` created.")
@@ -1323,7 +1349,8 @@ async def invites(ctx, member: discord.Member = None):
     target = member or ctx.author
     conn = db(); c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM invites WHERE inviter_id=? AND guild_id=?", (target.id, ctx.guild.id))
-    total = c.fetchone()[0]
+    total_res = c.fetchone()
+    total = total_res[0] if total_res else 0
     c.execute("SELECT invitee_id, ts FROM invites WHERE inviter_id=? AND guild_id=? ORDER BY ts DESC LIMIT 10", (target.id, ctx.guild.id))
     rows = c.fetchall(); conn.close()
     e = discord.Embed(title=f"Invite Stats: {target}", color=discord.Color.teal())
@@ -1694,7 +1721,8 @@ async def _post_announcement(ctx, event_type, name, game_name, time_str, target_
         return await ctx.send("Invalid time format. Use relative like `15m`, `2h`, `1d` or absolute like `22:30` or `10:30 PM`.")
     conn = db(); c = conn.cursor()
     c.execute("SELECT COALESCE(MAX(num),0) FROM event_logs WHERE guild_id=?", (ctx.guild.id,))
-    max_num = c.fetchone()[0]
+    max_res = c.fetchone()
+    max_num = max_res[0] if max_res else 0
     num = max_num + 1
     conn.commit(); conn.close()
     roblox_id = row["roblox_id"]
@@ -1807,9 +1835,10 @@ async def _end_event(ctx, event_type, number_str: str):
         conn = db(); c = conn.cursor()
         c.execute("INSERT INTO strikes (user_id,guild_id,reason,ts,mod_id) VALUES (?,?,?,?,?)",
                   (user_id, ctx.guild.id, f"Failure to attend a reacted {event_type}", now, ctx.author.id))
-        conn.commit(); sid = c.lastrowid
+        conn.commit()
         c.execute("SELECT COUNT(*) FROM strikes WHERE user_id=? AND guild_id=?", (user_id, ctx.guild.id))
-        count = c.fetchone()[0]
+        count_res = c.fetchone()
+        count = count_res[0] if count_res else 1
         conn.close()
         member = ctx.guild.get_member(user_id)
         if member:
@@ -1951,7 +1980,8 @@ async def dbstatus(ctx):
     try:
         conn = db(); c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM warns")
-        n = c.fetchone()[0]
+        n_res = c.fetchone()
+        n = n_res[0] if n_res else 0
         conn.close()
         e.add_field(name="Connection", value="OK", inline=False)
         e.add_field(name="Total Warns in DB", value=str(n), inline=False)
@@ -2463,9 +2493,10 @@ async def _run_application(ctx, app_type, questions):
                   (ctx.author.id, ctx.guild.id, formatted, "pending", datetime.datetime.utcnow().isoformat()))
         conn.commit()
         app_id = c.lastrowid if not IS_PG else None
-        if IS_PG:
+        if IS_PG or not app_id:
             c.execute("SELECT id FROM applications WHERE user_id=? AND guild_id=? AND status='pending' ORDER BY id DESC LIMIT 1", (ctx.author.id, ctx.guild.id))
-            app_id = c.fetchone()["id"]
+            r_app = c.fetchone()
+            app_id = r_app["id"] if r_app else 1
         conn.close()
 
         e.description = formatted[:4000]
