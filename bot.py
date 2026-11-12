@@ -136,12 +136,16 @@ def init_db():
             "CREATE TABLE IF NOT EXISTS afk(id SERIAL PRIMARY KEY,user_id BIGINT,guild_id BIGINT,reason TEXT,ts TEXT)",
             "CREATE TABLE IF NOT EXISTS roster(user_id BIGINT, guild_id BIGINT, PRIMARY KEY(user_id, guild_id))",
             "CREATE TABLE IF NOT EXISTS roster_config(guild_id BIGINT PRIMARY KEY, channel_id BIGINT, message_id BIGINT)",
-            "CREATE TABLE IF NOT EXISTS kos_challenges(id SERIAL PRIMARY KEY, guild_id BIGINT, channel_id BIGINT, challenger_id BIGINT, defender_id BIGINT, expiry_ts TEXT, status TEXT DEFAULT 'active')"
+            "CREATE TABLE IF NOT EXISTS kos_challenges(id SERIAL PRIMARY KEY, num BIGINT, guild_id BIGINT, channel_id BIGINT, challenger_id BIGINT, defender_id BIGINT, expiry_ts TEXT, status TEXT DEFAULT 'active')"
         ]
         for sql in pg_tables:
             c.execute(sql)
         try:
             c.execute("ALTER TABLE event_logs ADD COLUMN IF NOT EXISTS num BIGINT")
+        except Exception:
+            pass
+        try:
+            c.execute("ALTER TABLE kos_challenges ADD COLUMN IF NOT EXISTS num BIGINT")
         except Exception:
             pass
         try:
@@ -179,7 +183,7 @@ def init_db():
             "CREATE TABLE IF NOT EXISTS afk(id INTEGER PRIMARY KEY,user_id INT,guild_id INT,reason TEXT,ts TEXT)",
             "CREATE TABLE IF NOT EXISTS roster(user_id INT, guild_id INT, PRIMARY KEY(user_id, guild_id))",
             "CREATE TABLE IF NOT EXISTS roster_config(guild_id INT PRIMARY KEY, channel_id INT, message_id INT)",
-            "CREATE TABLE IF NOT EXISTS kos_challenges(id INTEGER PRIMARY KEY, guild_id INT, channel_id INT, challenger_id INT, defender_id INT, expiry_ts TEXT, status TEXT DEFAULT 'active')"
+            "CREATE TABLE IF NOT EXISTS kos_challenges(id INTEGER PRIMARY KEY, num INTEGER, guild_id INT, channel_id INT, challenger_id INT, defender_id INT, expiry_ts TEXT, status TEXT DEFAULT 'active')"
         ]
         for t in sqlite_tables:
             c.execute(t)
@@ -187,6 +191,8 @@ def init_db():
             try: c.execute(f"ALTER TABLE strikes ADD COLUMN {col} INTEGER")
             except sqlite3.OperationalError: pass
         try: c.execute("ALTER TABLE tickets ADD COLUMN ticket_type TEXT")
+        except sqlite3.OperationalError: pass
+        try: c.execute("ALTER TABLE kos_challenges ADD COLUMN num INTEGER")
         except sqlite3.OperationalError: pass
     conn.commit()
     conn.close()
@@ -298,10 +304,10 @@ async def check_kos_expiry():
         await asyncio.sleep(60)
         now = datetime.datetime.utcnow()
         conn = db(); c = conn.cursor()
-        c.execute("SELECT id, guild_id, channel_id, challenger_id, defender_id FROM kos_challenges WHERE status='active' AND expiry_ts <= ?", (now.isoformat(),))
+        c.execute("SELECT id, num, guild_id, channel_id, challenger_id, defender_id FROM kos_challenges WHERE status='active' AND expiry_ts <= ?", (now.isoformat(),))
         expired = c.fetchall()
         for row in expired:
-            cid, gid, ch_id, challenger_id, defender_id = row["id"], row["guild_id"], row["channel_id"], row["challenger_id"], row["defender_id"]
+            cid, num, gid, ch_id, challenger_id, defender_id = row["id"], row["num"], row["guild_id"], row["channel_id"], row["challenger_id"], row["defender_id"]
             guild = bot.get_guild(gid)
             if guild:
                 role = get_role_by_name(guild, "SIN | War Assembly")
@@ -324,7 +330,7 @@ async def check_kos_expiry():
                 ch = guild.get_channel(ch_id)
                 if ch:
                     try:
-                        await ch.send(f"⏰ **24 hours have elapsed without verification!** Defender (<@{defender_id}>) automatically loses the role, and Challenger (<@{challenger_id}>) is awarded the war spot.")
+                        await ch.send(f"⏰ **24 hours have elapsed for KOS #{num} without verification!** Defender (<@{defender_id}>) automatically loses the role, and Challenger (<@{challenger_id}>) is awarded the war spot.")
                     except Exception: pass
             c.execute("UPDATE kos_challenges SET status='expired' WHERE id=?", (cid,))
             conn.commit()
@@ -997,7 +1003,7 @@ async def unwarn(ctx, member: discord.Member):
     if not row:
         conn.close()
         return await ctx.send("No warnings found for this user.")
-    wid, reason = row
+    wid, reason = row["id"], row["reason"]
     c.execute("DELETE FROM warns WHERE id=?", (wid,))
     conn.commit(); conn.close()
     await _log_punishment(ctx.guild, "unwarn (revert)", member, ctx.author, reason)
@@ -1422,13 +1428,20 @@ async def setuproster(ctx):
 
 @bot.command()
 @require_role("STAFF")
-async def verifykos(ctx, winner: discord.Member):
+async def verifykos(ctx, number_str: str, winner: discord.Member):
+    if not number_str.startswith("#"):
+        return await ctx.send("Number must start with #. Example: `%verifykos #1 @winner`")
+    try:
+        num = int(number_str[1:].strip())
+    except ValueError:
+        return await ctx.send("Invalid number format. Use `%verifykos #1 @winner`.")
+
     conn = db(); c = conn.cursor()
-    c.execute("SELECT id, challenger_id, defender_id FROM kos_challenges WHERE channel_id=? AND status='active'", (ctx.channel.id,))
+    c.execute("SELECT id, challenger_id, defender_id FROM kos_challenges WHERE num=? AND guild_id=? AND status='active'", (num, ctx.guild.id))
     row = c.fetchone()
     if not row:
         conn.close()
-        return await ctx.send("This is not an active Warspot KOS channel awaiting verification.")
+        return await ctx.send(f"No active Warspot KOS challenge found for #{num}.")
     
     cid, challenger_id, defender_id = row["id"], row["challenger_id"], row["defender_id"]
     if winner.id not in (challenger_id, defender_id):
@@ -1453,12 +1466,12 @@ async def verifykos(ctx, winner: discord.Member):
             c.execute("INSERT INTO roster (user_id, guild_id) VALUES (?, ?) ON CONFLICT (user_id, guild_id) DO NOTHING", (challenger_id, guild.id))
         else:
             c.execute("INSERT OR IGNORE INTO roster (user_id, guild_id) VALUES (?, ?)", (challenger_id, guild.id))
-        await ctx.send(f"🎉 **Challenger ({winner.mention}) won the KOS!** They have been awarded the `SIN | War Assembly` role, and the roster has been updated.")
+        await ctx.send(f"🎉 **Challenger ({winner.mention}) won KOS #{num}!** They have been awarded the `SIN | War Assembly` role, and the roster has been updated.")
     else:
         if role and defender:
             try: await defender.add_roles(role)
             except Exception: pass
-        await ctx.send(f"🛡️ **Defender ({winner.mention}) successfully defended their role!** They retain the `SIN | War Assembly` role.")
+        await ctx.send(f"🛡️ **Defender ({winner.mention}) successfully defended KOS #{num}!** They retain the `SIN | War Assembly` role.")
 
     c.execute("UPDATE kos_challenges SET status='verified' WHERE id=?", (cid,))
     conn.commit(); conn.close()
@@ -1541,15 +1554,19 @@ async def ticket(ctx, *, ticket_type: str = ""):
             await ch.set_permissions(target_member, view_channel=True, send_messages=True, read_message_history=True)
         except Exception: pass
 
-        expiry = datetime.datetime.utcnow() + datetime.timedelta(hours=24)
         conn = db(); c = conn.cursor()
-        c.execute("INSERT INTO kos_challenges (guild_id, channel_id, challenger_id, defender_id, expiry_ts, status) VALUES (?,?,?,?,?, 'active')",
-                  (guild.id, ch.id, ctx.author.id, target_member.id, expiry.isoformat()))
+        c.execute("SELECT COALESCE(MAX(num), 0) FROM kos_challenges WHERE guild_id=?", (guild.id,))
+        max_num = c.fetchone()[0]
+        num = max_num + 1
+
+        expiry = datetime.datetime.utcnow() + datetime.timedelta(hours=24)
+        c.execute("INSERT INTO kos_challenges (num, guild_id, channel_id, challenger_id, defender_id, expiry_ts, status) VALUES (?,?,?,?,?,?, 'active')",
+                  (num, guild.id, ch.id, ctx.author.id, target_member.id, expiry.isoformat()))
         conn.commit(); conn.close()
 
         staff_role = get_role_by_name(guild, "STAFF")
         s_mention = staff_role.mention if staff_role else "@STAFF"
-        await ch.send(f"{target_member.mention} You have been requested to KOS for your warspot! You have 24 hours to defend your spot.\n{s_mention} A staff member must review and use `%verifykos # @winner` when complete.")
+        await ch.send(f"{target_member.mention} You have been requested to KOS for your warspot! You have 24 hours to defend your spot.\n{s_mention} A staff member must review and use `%verifykos #{num} @winner` when complete.")
 
     await ctx.send(f"Ticket created: {ch.mention}", delete_after=10)
 
@@ -1964,7 +1981,7 @@ async def raidcancel(ctx, number: str, *, reason: str):
 async def help(ctx):
     e = discord.Embed(title="Command List — Sinister Cartel", color=discord.Color.blurple())
     e.add_field(name="Moderation", value="**Manager+**: unban, ban, tempban\n**Head Admin+**: kick, nick, addrole, removerole, promote, demote\n**Admin+**: purge, slowmode, lock, unlock, lockdown, unlockdown, accept/deny member apps\n**Moderator+**: mute, unmute, tempmute\n**STAFF+**: warn, warnlist, unwarn, clearwarnings, strike, removestrike, modstats, note, notes", inline=False)
-    e.add_field(name="Tickets & War", value="`%ticket <Support|Warspot|Report|Purchase|Other>`\n`%verifykos # @winner` (STAFF+)\n`%setuproster` (Owner+)", inline=False)
+    e.add_field(name="Tickets & War", value="`%ticket <Support|Warspot|Report|Purchase|Other>`\n`%verifykos #1 @winner` (STAFF+)\n`%setuproster` (Owner+)", inline=False)
     e.add_field(name="Fun & Utility", value="8ball, coinflip, roll, rps, choose, rate, reverse, mock, cat, dog, meme, avatar, userinfo, serverinfo, ping, invite, say, embed, poll, remind, timer, invites, inviteleaderboard, activity, attendance, topattendees, warstats, quote, quotes, seen, uptime", inline=False)
     e.add_field(name="Tags & Ranks", value="tag, tagcreate, tagedit, tagdelete, taglist, taginfo, warrank, warwin, warloss", inline=False)
     e.add_field(name="Events", value="event, eventstart, eventend, eventcancel, deployment, deploymentstart, deploymentend, deploymentcancel, raid, raidstart, raidend, raidcancel", inline=False)
@@ -2500,13 +2517,13 @@ async def _run_application(ctx, app_type, questions):
         conn.close()
 
         e.description = formatted[:4000]
-        e.set_footer(text="Manager+ use `%review staffapp #ID` to review privately in DMs.")
+        e.set_footer(text="Manager+ use `%review staffapp @user` to review privately in DMs.")
         manager_role = get_role_by_name(ctx.guild, "Manager | 2nd in command")
         mention = manager_role.mention if manager_role else "@Manager"
         await pending_ch.send(f"{mention} New Staff Application submitted by {ctx.author.mention}", embed=e)
     else:
         e.description = formatted[:4000]
-        e.set_footer(text=f"Type: member | Use %review #N to view | Admin+ can %accept/%deny @user")
+        e.set_footer(text=f"Type: member | Use %review @user to view | Admin+ can %accept/%deny @user")
         staff_role = discord.utils.get(ctx.guild.roles, name="STAFF")
         mention = staff_role.mention if staff_role else "@STAFF"
         app_msg = await pending_ch.send(f"{mention} New Member Application {ctx.author.mention}", embed=e)
@@ -2570,35 +2587,37 @@ async def pendingapps(ctx):
         name = u.mention if u else f"<@{r['user_id']}>"
         lines.append(f"**#{r['id']}** — {name} — {r['ts'][:10]}")
     e = discord.Embed(title="Pending Applications", description="\n".join(lines), color=discord.Color.orange())
-    e.set_footer(text="Use %review #<id> to view details and vote.")
+    e.set_footer(text="Use %review @user to view details.")
     await ctx.send(embed=e)
 
 @bot.command()
 async def review(ctx, *args):
     if not args:
-        return await ctx.send("Usage: `%review #ID` or `%review staffapp #ID`")
+        return await ctx.send("Usage: `%review @user` or `%review staffapp @user`")
 
     if args[0].lower() == "staffapp":
         if not has_role_or_higher(ctx.author, "Manager | 2nd in command"):
             return await ctx.send("You must be Manager | 2nd in command or higher to review staff applications.")
         if len(args) < 2:
-            return await ctx.send("Please provide an Application ID. Example: `%review staffapp 5`")
+            return await ctx.send("Please specify the applicant. Example: `%review staffapp @user`")
         
-        raw_id = args[1].lstrip("#")
-        try:
-            app_id = int(raw_id)
-        except ValueError:
-            return await ctx.send("Invalid Application ID.")
+        target_member = await _resolve_member(ctx, args[1].lstrip("#"))
+        target_uid = target_member.id if target_member else None
+        if not target_uid and args[1].lstrip("#").isdigit():
+            target_uid = int(args[1].lstrip("#"))
 
         conn = db(); c = conn.cursor()
-        c.execute("SELECT user_id, content, status FROM applications WHERE id=? AND guild_id=?", (app_id, ctx.guild.id))
+        if target_uid:
+            c.execute("SELECT id, user_id, content, status FROM applications WHERE user_id=? AND guild_id=? AND status='pending' ORDER BY id DESC LIMIT 1", (target_uid, ctx.guild.id))
+        else:
+            raw_id = args[1].lstrip("#")
+            c.execute("SELECT id, user_id, content, status FROM applications WHERE id=? AND guild_id=?", (int(raw_id) if raw_id.isdigit() else 0, ctx.guild.id))
         row = c.fetchone(); conn.close()
 
         if not row:
             return await ctx.send("Staff application not found.")
-        if row["status"] != "pending":
-            return await ctx.send(f"This staff application is already **{row['status']}**.")
 
+        app_id = row["id"]
         u = ctx.guild.get_member(row["user_id"])
         user_name = u.name if u else f"User {row['user_id']}"
         
@@ -2606,7 +2625,7 @@ async def review(ctx, *args):
             dm = await ctx.author.create_dm()
             e = discord.Embed(title=f"Staff Application #{app_id} — {user_name}", color=discord.Color.gold())
             e.description = row["content"][:4000] if row["content"] else "(no content)"
-            e.set_footer(text="Use `%accept staffapp #ID` or `%deny staffapp #ID` in the server to act on this.")
+            e.set_footer(text="Use `%accept staffapp @user` or `%deny staffapp @user` in the server to act on this.")
             await dm.send(embed=e)
             await ctx.send(f"Sent details for Staff Application **#{app_id}** to your DMs.", delete_after=5)
         except Exception:
@@ -2616,24 +2635,24 @@ async def review(ctx, *args):
     if not has_role_or_higher(ctx.author, "Admin"):
         return await ctx.send("You need the Admin role or higher to review member applications.")
     
-    raw_id = args[0].lstrip("#")
-    try:
-        app_id = int(raw_id)
-    except ValueError:
-        return await ctx.send("Invalid Application ID.")
+    target_member = await _resolve_member(ctx, args[0].lstrip("#"))
+    target_uid = target_member.id if target_member else None
+    if not target_uid and args[0].lstrip("#").isdigit():
+        target_uid = int(args[0].lstrip("#"))
 
     conn = db(); c = conn.cursor()
-    c.execute("SELECT user_id, content, status FROM applications WHERE id=? AND guild_id=?", (app_id, ctx.guild.id))
+    if target_uid:
+        c.execute("SELECT id, user_id, content, status FROM applications WHERE user_id=? AND guild_id=? AND status='pending' ORDER BY id DESC LIMIT 1", (target_uid, ctx.guild.id))
+    else:
+        raw_id = args[0].lstrip("#")
+        c.execute("SELECT id, user_id, content, status FROM applications WHERE id=? AND guild_id=?", (int(raw_id) if raw_id.isdigit() else 0, ctx.guild.id))
     row = c.fetchone()
     if not row:
         conn.close()
         return await ctx.send("Application not found.")
-    if row["status"] != "pending":
-        conn.close()
-        return await ctx.send(f"This application is already **{row['status']}**.")
     conn.close()
     
-    e = discord.Embed(title=f"Application #{app_id}", color=discord.Color.blurple())
+    e = discord.Embed(title=f"Application #{row['id']}", color=discord.Color.blurple())
     u = ctx.guild.get_member(row["user_id"])
     e.set_author(name=u.name if u else f"User {row['user_id']}", icon_url=u.display_avatar.url if u else None)
     e.description = row["content"][:4000] if row["content"] else "(no content)"
@@ -2642,30 +2661,31 @@ async def review(ctx, *args):
 @bot.command()
 async def accept(ctx, *args):
     if not args:
-        return await ctx.send("Usage: `%accept @user` or `%accept staffapp #ID`")
+        return await ctx.send("Usage: `%accept @user` or `%accept staffapp @user`")
 
     if args[0].lower() == "staffapp":
         if not has_role_or_higher(ctx.author, "Manager | 2nd in command"):
             return await ctx.send("You must be Manager | 2nd in command or higher to accept staff applications.")
         if len(args) < 2:
-            return await ctx.send("Please specify the application ID. Example: `%accept staffapp 5`")
+            return await ctx.send("Please specify the applicant. Example: `%accept staffapp @user`")
         
-        raw_id = args[1].lstrip("#")
-        try:
-            app_id = int(raw_id)
-        except ValueError:
-            return await ctx.send("Invalid Application ID.")
+        target_member = await _resolve_member(ctx, args[1].lstrip("#"))
+        target_uid = target_member.id if target_member else None
+        if not target_uid and args[1].lstrip("#").isdigit():
+            target_uid = int(args[1].lstrip("#"))
 
         conn = db(); c = conn.cursor()
-        c.execute("SELECT user_id, status FROM applications WHERE id=? AND guild_id=?", (app_id, ctx.guild.id))
+        if target_uid:
+            c.execute("SELECT id, user_id, status FROM applications WHERE user_id=? AND guild_id=? AND status='pending' ORDER BY id DESC LIMIT 1", (target_uid, ctx.guild.id))
+        else:
+            raw_id = args[1].lstrip("#")
+            c.execute("SELECT id, user_id, status FROM applications WHERE id=? AND guild_id=?", (int(raw_id) if raw_id.isdigit() else 0, ctx.guild.id))
         row = c.fetchone()
         if not row:
             conn.close()
             return await ctx.send("Staff application not found.")
-        if row["status"] != "pending":
-            conn.close()
-            return await ctx.send(f"This application is already **{row['status']}**.")
         
+        app_id = row["id"]
         c.execute("UPDATE applications SET status='accepted' WHERE id=?", (app_id,))
         conn.commit(); conn.close()
 
@@ -2676,10 +2696,8 @@ async def accept(ctx, *args):
             
             roles_to_add = [r for r in (staff_role, mod_role) if r is not None]
             if roles_to_add:
-                try: 
-                    await member.add_roles(*roles_to_add)
-                except Exception: 
-                    pass
+                try: await member.add_roles(*roles_to_add)
+                except Exception: pass
             
             staff_chat = discord.utils.get(ctx.guild.text_channels, name="staff-chat")
             if staff_chat:
@@ -2730,30 +2748,31 @@ async def accept(ctx, *args):
 @bot.command()
 async def deny(ctx, *args):
     if not args:
-        return await ctx.send("Usage: `%deny @user` or `%deny staffapp #ID`")
+        return await ctx.send("Usage: `%deny @user` or `%deny staffapp @user`")
 
     if args[0].lower() == "staffapp":
         if not has_role_or_higher(ctx.author, "Manager | 2nd in command"):
             return await ctx.send("You must be Manager | 2nd in command or higher to deny staff applications.")
         if len(args) < 2:
-            return await ctx.send("Please specify the application ID. Example: `%deny staffapp 5`")
+            return await ctx.send("Please specify the applicant. Example: `%deny staffapp @user`")
         
-        raw_id = args[1].lstrip("#")
-        try:
-            app_id = int(raw_id)
-        except ValueError:
-            return await ctx.send("Invalid Application ID.")
+        target_member = await _resolve_member(ctx, args[1].lstrip("#"))
+        target_uid = target_member.id if target_member else None
+        if not target_uid and args[1].lstrip("#").isdigit():
+            target_uid = int(args[1].lstrip("#"))
 
         conn = db(); c = conn.cursor()
-        c.execute("SELECT user_id, status FROM applications WHERE id=? AND guild_id=?", (app_id, ctx.guild.id))
+        if target_uid:
+            c.execute("SELECT id, user_id, status FROM applications WHERE user_id=? AND guild_id=? AND status='pending' ORDER BY id DESC LIMIT 1", (target_uid, ctx.guild.id))
+        else:
+            raw_id = args[1].lstrip("#")
+            c.execute("SELECT id, user_id, status FROM applications WHERE id=? AND guild_id=?", (int(raw_id) if raw_id.isdigit() else 0, ctx.guild.id))
         row = c.fetchone()
         if not row:
             conn.close()
             return await ctx.send("Staff application not found.")
-        if row["status"] != "pending":
-            conn.close()
-            return await ctx.send(f"This application is already **{row['status']}**.")
         
+        app_id = row["id"]
         await ctx.send(f"Please enter the reason for denying Staff Application **#{app_id}** (You have 60 seconds):")
         def check(m):
             return m.author == ctx.author and m.channel == ctx.channel
